@@ -19,7 +19,7 @@ Rather than treating oversight as a sequence of isolated prompts, AdaLens preser
 
 ## System Overview
 
-AdaLens is a web-based client-server system with a React-TS frontend and a Flask-based Python backend. The backend exposes execution and steering requests over HTTP and streams real-time events and generated artifacts to the interface via Server-Sent Events (SSE). The system is model-agnostic by design.
+AdaLens is a web-based client-server system with a React-TS frontend and a Python backend runtime. The backend exposes execution and steering requests over HTTP and streams real-time events and generated artifacts to the interface via Server-Sent Events (SSE). The system is model-agnostic by design.
 
 At the backend, AdaLens adopts an orchestrator-worker architecture. The orchestrator handles high-level reasoning over the analytical process: it creates and dispatches plans, evaluates progress, synthesizes findings, and determines how the run should proceed across analytical steps. Each worker executes one analytical plan and consists of two sequential components:
 
@@ -107,16 +107,7 @@ python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
 
-### 2. Configure model access
-
-Provide the required API credentials through environment variables or a local `.env` file at the repository root. The backend configuration currently reads keys such as:
-
-- `OPENAI_API_KEY_vapi`
-- `OPENAI_API_KEY_n1n`
-
-Do not commit credential files or secrets.
-
-### 3. Install and launch the web interface
+### 2. Install and launch the web interface
 
 ```bash
 cd frontend
@@ -128,22 +119,6 @@ This starts the local gateway and the frontend development server. By default, t
 
 - `http://localhost:5173` for the client
 - `http://localhost:3001` for the local gateway
-
-### 4. Optional backend CLI smoke run
-
-If you want to run the backend directly on a sample dataset:
-
-```bash
-cd backend
-python cli.py --dataset ..\data\vgsales.csv --user-goal "Explore the dataset"
-```
-
-You can also run the default smoke entrypoint:
-
-```bash
-cd backend
-python main.py
-```
 
 ## Datasets and Outputs
 
