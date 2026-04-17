@@ -7,6 +7,7 @@
     "dev": "node src/server/devLauncher.mjs",
     "dev:client": "vite",
     "dev:server": "tsx watch src/server/index.ts",
+    "test": "node test/run-tests.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },

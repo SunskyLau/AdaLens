@@ -125,14 +125,18 @@ export async function updateRunSettings(
 export async function controlPlan(
   runId: string,
   planId: string,
-  action: PlanControlAction
+  action: PlanControlAction,
+  options?: { userAuthoredText?: string }
 ): Promise<PlanControlResponse> {
   const response = await fetch(`${API_BASE}/runs/${runId}/plans/${planId}/control`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ action }),
+    body: JSON.stringify({
+      action,
+      ...(options?.userAuthoredText ? { user_authored_text: options.userAuthoredText } : {}),
+    }),
   });
 
   if (!response.ok) {

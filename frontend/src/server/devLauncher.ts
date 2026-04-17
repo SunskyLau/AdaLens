@@ -3,15 +3,11 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 
 import {
-  normalizeLlmCacheFileName,
+  CREATE_PLANS_REPLAY_ENV,
   withBackendLaunchEnv,
 } from './backendEnv';
 
-const CREATE_PLANS_REPLAY_ENV = 'AGENTIC_EDA_CREATE_PLANS_REPLAY';
-
 type DevLauncherOptions = {
-  llmCacheReadFile?: string;
-  llmCacheWriteFile?: string;
   replay?: boolean;
   stableLlmOutput?: boolean;
 };
@@ -40,8 +36,6 @@ function resolveNpmLaunch(
 }
 
 export function parseDevLauncherArgs(argv: string[]): DevLauncherOptions {
-  let llmCacheReadFile: string | undefined;
-  let llmCacheWriteFile: string | undefined;
   let replay = false;
   let stableLlmOutput = false;
 
@@ -55,36 +49,10 @@ export function parseDevLauncherArgs(argv: string[]): DevLauncherOptions {
       stableLlmOutput = true;
       continue;
     }
-    if (arg.startsWith('--llm-cache-read=')) {
-      llmCacheReadFile = normalizeLlmCacheFileName(arg.slice('--llm-cache-read='.length));
-      continue;
-    }
-    if (arg.startsWith('--llm-cache-write=')) {
-      llmCacheWriteFile = normalizeLlmCacheFileName(arg.slice('--llm-cache-write='.length));
-      continue;
-    }
-    if (arg === '--llm-cache-read') {
-      const nextValue = argv[index + 1];
-      if (!nextValue) {
-        throw new Error('--llm-cache-read requires a cache file name');
-      }
-      llmCacheReadFile = normalizeLlmCacheFileName(nextValue);
-      index += 1;
-      continue;
-    }
-    if (arg === '--llm-cache-write') {
-      const nextValue = argv[index + 1];
-      if (!nextValue) {
-        throw new Error('--llm-cache-write requires a cache file name');
-      }
-      llmCacheWriteFile = normalizeLlmCacheFileName(nextValue);
-      index += 1;
-      continue;
-    }
     throw new Error(`Unknown dev launcher argument: ${arg}`);
   }
 
-  return { llmCacheReadFile, llmCacheWriteFile, replay, stableLlmOutput };
+  return { replay, stableLlmOutput };
 }
 
 export function buildDevProcessSpecs(
@@ -95,8 +63,6 @@ export function buildDevProcessSpecs(
   const options = parseDevLauncherArgs(argv);
   const npmLaunch = resolveNpmLaunch(platform);
   const serverEnv = withBackendLaunchEnv(baseEnv, {
-    readFile: options.llmCacheReadFile,
-    writeFile: options.llmCacheWriteFile,
     stableLlmOutput: options.stableLlmOutput,
   });
   if (options.replay) {

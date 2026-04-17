@@ -12,23 +12,8 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-try:
-    from .path_bootstrap import ensure_backend_on_path
-except ImportError:  # pragma: no cover
-    from path_bootstrap import ensure_backend_on_path  # type: ignore[no-redef]
-
-ensure_backend_on_path()
-
-from cache_normalization import build_summarizer_cache_normalization_context  # noqa: E402
-from model_cache import (  # noqa: E402
-    build_model_cache_run_context,
-    consume_last_model_cache_binding,
-    use_model_cache_normalization_context,
-    use_model_cache_run_context,
-)
-
-from .language_context import canonical_user_message_text, latest_user_authored_text
-from .models import AtomicInsight, InsightType, PlanItem, normalize_steering_message_kind
+from .language_context import latest_user_authored_text
+from .models import AtomicInsight, InsightType, PlanItem
 from config import (
     create_chat_completion_with_sampling_controls,
     IMPORTANCE_WEIGHT_IMPACT,
@@ -42,7 +27,7 @@ from config import (
 )
 
 if TYPE_CHECKING:
-    from .store import RunStore
+    from .persistence import RunStore
 
 
 DEFAULT_INTEREST_FALLBACK_SCORE = 0.5
@@ -68,24 +53,8 @@ TYPE_SIGNIFICANCE_FALLBACKS: Dict[InsightType, float] = {
     "data_quality": 0.62,
 }
 
-_METRICS_STEERING_KINDS = {"focus", "ignore", "elaborate", "create"}
-
-
 def _latest_metrics_language_text(user_messages: list[Any] | None) -> str:
-    if not user_messages:
-        return ""
-
-    latest_chat_text = ""
-    for message in reversed(list(user_messages)):
-        text = canonical_user_message_text(message)
-        if not text:
-            continue
-        kind = normalize_steering_message_kind(getattr(message, "kind", None))
-        if kind in _METRICS_STEERING_KINDS:
-            return text
-        if not latest_chat_text and kind == "chat":
-            latest_chat_text = text
-    return latest_chat_text
+    return latest_user_authored_text(user_messages)
 
 INSIGHT_TYPE_SIGNIFICANCE_HINTS: Dict[InsightType, str] = {
     "value": (
@@ -747,39 +716,6 @@ def _build_metrics_prompts(
     return system_prompt, user_prompt
 
 
-def _build_metrics_cache_context(
-    atomic: AtomicInsight,
-    plan: PlanItem,
-    store: Optional["RunStore"],
-) -> tuple[Any, Any]:
-    run_context = build_model_cache_run_context(getattr(store, "run_dir", None))
-    dataset_path = ""
-    dataset_info: Dict[str, Any] | None = None
-    if store is not None:
-        try:
-            state = store.load_state()
-        except Exception:
-            state = None
-        if state is not None:
-            dataset_path = str(getattr(state, "dataset_path", "") or "")
-            raw_dataset_info = getattr(state, "dataset_info", None)
-            if isinstance(raw_dataset_info, dict):
-                dataset_info = raw_dataset_info
-    evidence = getattr(atomic, "evidence", None)
-    artifact_paths = [
-        str(getattr(evidence, field_name, "") or "").strip()
-        for field_name in ("code_path", "output_path", "plot_path")
-        if str(getattr(evidence, field_name, "") or "").strip()
-    ]
-    normalization_context = build_summarizer_cache_normalization_context(
-        plan_id=plan.plan_id,
-        dataset_path=dataset_path,
-        dataset_info=dataset_info,
-        artifact_paths=artifact_paths,
-    )
-    return run_context, normalization_context
-
-
 def _call_llm_metrics_once(
     atomic: AtomicInsight,
     plan: PlanItem,
@@ -814,20 +750,11 @@ def _call_llm_metrics_once(
             params["max_tokens"] = LLM_MAX_TOKENS
         if LLM_TIMEOUT_SECS:
             params["timeout"] = LLM_TIMEOUT_SECS
-        run_context, normalization_context = _build_metrics_cache_context(
-            atomic,
-            plan,
-            store,
+        response = create_chat_completion_with_sampling_controls(
+            OPENAI_CLIENT,
+            params=params,
+            temperature=0.1,
         )
-        with use_model_cache_run_context(run_context):
-            with use_model_cache_normalization_context(normalization_context):
-                consume_last_model_cache_binding()
-                response = create_chat_completion_with_sampling_controls(
-                    OPENAI_CLIENT,
-                    params=params,
-                    temperature=0.1,
-                )
-                consume_last_model_cache_binding()
         return _extract_json_object(_normalize_response_text(response.choices[0].message.content))
     except Exception as exc:
         print(f"[IMPORTANCE] LLM metrics call failed; using fallbacks. error={exc}")

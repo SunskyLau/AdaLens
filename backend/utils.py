@@ -96,13 +96,12 @@ def execute_python_code_streaming(
         stderr_thread.start()
 
         wait_started = time.monotonic()
-        interrupted_control_state: str | None = None
         while True:
-            current_control_state = stop_requested() if stop_requested is not None else None
-            if current_control_state in {"pause_requested", "terminate_requested"}:
-                interrupted_control_state = current_control_state
-                process.kill()
-                break
+            # Safe-boundary controls are handled by the worker loop after the
+            # current execute_code step returns, rather than by killing the
+            # subprocess mid-step here.
+            if stop_requested is not None:
+                stop_requested()
             if process.poll() is not None:
                 break
             if time.monotonic() - wait_started >= timeout:
@@ -120,22 +119,6 @@ def execute_python_code_streaming(
                     "error": f"Execution timeout after {timeout} seconds",
                 }
             time.sleep(0.05)
-
-        if interrupted_control_state is not None:
-            try:
-                process.wait(timeout=2)
-            except Exception:
-                pass
-            stdout_thread.join(timeout=2)
-            stderr_thread.join(timeout=2)
-            return {
-                "success": False,
-                "stdout": "".join(stdout_chunks),
-                "stderr": "".join(stderr_chunks),
-                "error": f"Execution interrupted due to {interrupted_control_state}",
-                "stopped": True,
-                "control_state": interrupted_control_state,
-            }
 
         stdout_thread.join()
         stderr_thread.join()

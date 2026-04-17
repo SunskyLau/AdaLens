@@ -2,34 +2,10 @@ import { spawn } from 'child_process';
 import path from 'path';
 import { pathToFileURL } from 'url';
 
-const LLM_CACHE_READ_FILE_ENV = 'AGENTIC_EDA_LLM_CACHE_READ_FILE';
-const LLM_CACHE_WRITE_FILE_ENV = 'AGENTIC_EDA_LLM_CACHE_WRITE_FILE';
 const STABLE_LLM_OUTPUT_ENV = 'AGENTIC_EDA_STABLE_LLM_OUTPUT';
 const CREATE_PLANS_REPLAY_ENV = 'AGENTIC_EDA_CREATE_PLANS_REPLAY';
 
-function normalizeLlmCacheFileName(rawValue) {
-  const trimmed = String(rawValue ?? '').trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  if (trimmed === '.' || trimmed === '..') {
-    throw new Error(`Invalid cache file name: ${trimmed}`);
-  }
-  if (/[\\/]/.test(trimmed)) {
-    throw new Error(`Cache file name must stay within backend/.cache: ${trimmed}`);
-  }
-  if (/[<>:"|?*\u0000-\u001f]/.test(trimmed)) {
-    throw new Error(`Invalid cache file name: ${trimmed}`);
-  }
-  if (trimmed.toLowerCase().endsWith('.json')) {
-    return trimmed;
-  }
-  return `${trimmed}.json`;
-}
-
 export function parseDevLauncherArgs(argv) {
-  let llmCacheReadFile;
-  let llmCacheWriteFile;
   let replay = false;
   let stableLlmOutput = false;
 
@@ -43,53 +19,15 @@ export function parseDevLauncherArgs(argv) {
       stableLlmOutput = true;
       continue;
     }
-    if (arg.startsWith('--llm-cache-read=')) {
-      llmCacheReadFile = normalizeLlmCacheFileName(arg.slice('--llm-cache-read='.length));
-      continue;
-    }
-    if (arg.startsWith('--llm-cache-write=')) {
-      llmCacheWriteFile = normalizeLlmCacheFileName(arg.slice('--llm-cache-write='.length));
-      continue;
-    }
-    if (arg === '--llm-cache-read') {
-      const nextValue = argv[index + 1];
-      if (!nextValue) {
-        throw new Error('--llm-cache-read requires a cache file name');
-      }
-      llmCacheReadFile = normalizeLlmCacheFileName(nextValue);
-      index += 1;
-      continue;
-    }
-    if (arg === '--llm-cache-write') {
-      const nextValue = argv[index + 1];
-      if (!nextValue) {
-        throw new Error('--llm-cache-write requires a cache file name');
-      }
-      llmCacheWriteFile = normalizeLlmCacheFileName(nextValue);
-      index += 1;
-      continue;
-    }
     throw new Error(`Unknown dev launcher argument: ${arg}`);
   }
 
-  return { llmCacheReadFile, llmCacheWriteFile, replay, stableLlmOutput };
+  return { replay, stableLlmOutput };
 }
 
 function withBackendLaunchEnv(baseEnv, options) {
   const env = { ...baseEnv };
-  delete env[LLM_CACHE_READ_FILE_ENV];
-  delete env[LLM_CACHE_WRITE_FILE_ENV];
   delete env[STABLE_LLM_OUTPUT_ENV];
-
-  const readFile = normalizeLlmCacheFileName(options.llmCacheReadFile);
-  const writeFile = normalizeLlmCacheFileName(options.llmCacheWriteFile);
-
-  if (readFile) {
-    env[LLM_CACHE_READ_FILE_ENV] = readFile;
-  }
-  if (writeFile) {
-    env[LLM_CACHE_WRITE_FILE_ENV] = writeFile;
-  }
   if (options.stableLlmOutput) {
     env[STABLE_LLM_OUTPUT_ENV] = '1';
   }
@@ -113,7 +51,9 @@ function resolveNpmLaunch(platform = process.platform) {
 export function buildDevProcessSpecs(argv, baseEnv = process.env, platform = process.platform) {
   const options = parseDevLauncherArgs(argv);
   const npmLaunch = resolveNpmLaunch(platform);
-  const serverEnv = withBackendLaunchEnv(baseEnv, options);
+  const serverEnv = withBackendLaunchEnv(baseEnv, {
+    stableLlmOutput: options.stableLlmOutput,
+  });
   if (options.replay) {
     serverEnv[CREATE_PLANS_REPLAY_ENV] = '1';
   } else {

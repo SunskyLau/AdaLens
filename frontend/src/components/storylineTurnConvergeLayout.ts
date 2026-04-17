@@ -137,6 +137,7 @@ export interface StorylineActivePlanArea {
   text: string;
   status: PlanItem['status'];
   controlState: NonNullable<PlanItem['control_state']>;
+  launchRequested: boolean;
   turnIndex: number;
   left: number;
   right: number;
@@ -773,7 +774,7 @@ function resolveActivePlanDisplayFields(
 }
 
 function resolveActivePlanDisplayStatus(
-  plan: Pick<PlanItem, 'status' | 'control_state'>
+  plan: Pick<PlanItem, 'status' | 'control_state' | 'launch_requested'>
 ): PlanItem['status'] {
   if (plan.control_state === 'terminate_requested' && plan.status !== 'terminated') {
     return 'terminated';
@@ -785,7 +786,7 @@ function resolveActivePlanDisplayStatus(
 }
 
 function getActivePlanVisibleActionCount(
-  plan: Pick<PlanItem, 'status' | 'control_state'>
+  plan: Pick<PlanItem, 'status' | 'control_state' | 'launch_requested'>
 ): number {
   const displayStatus = resolveActivePlanDisplayStatus(plan);
   if (displayStatus === 'pending' || displayStatus === 'paused') {
@@ -804,7 +805,10 @@ function getActivePlanVisibleActionCount(
   return 0;
 }
 
-function getActivePlanStatusLabel(plan: Pick<PlanItem, 'status' | 'control_state'>): string {
+function getActivePlanStatusLabel(plan: Pick<PlanItem, 'status' | 'control_state' | 'launch_requested'>): string {
+  if (resolveActivePlanDisplayStatus(plan) === 'pending' && plan.launch_requested) {
+    return 'launch requested';
+  }
   switch (resolveActivePlanDisplayStatus(plan)) {
     case 'paused':
       return 'paused';
@@ -824,7 +828,7 @@ function getActivePlanStatusLabel(plan: Pick<PlanItem, 'status' | 'control_state
 }
 
 function estimateActivePlanStatusBadgeWidth(
-  plan: Pick<PlanItem, 'status' | 'control_state'>
+  plan: Pick<PlanItem, 'status' | 'control_state' | 'launch_requested'>
 ): number {
   const label = getActivePlanStatusLabel(plan);
   return Math.ceil(
@@ -836,7 +840,7 @@ function estimateActivePlanStatusBadgeWidth(
 }
 
 function estimateActivePlanControlsWidth(
-  plan: Pick<PlanItem, 'status' | 'control_state'>
+  plan: Pick<PlanItem, 'status' | 'control_state' | 'launch_requested'>
 ): number {
   const actionCount = getActivePlanVisibleActionCount(plan);
   if (actionCount <= 0) {
@@ -849,7 +853,7 @@ function estimateActivePlanControlsWidth(
 }
 
 function estimateActivePlanRequiredAreaWidth(args: {
-  plan: Pick<PlanItem, 'status' | 'control_state'>;
+  plan: Pick<PlanItem, 'status' | 'control_state' | 'launch_requested'>;
   showPlanText: boolean;
 }): number {
   const { plan, showPlanText } = args;
@@ -1604,6 +1608,7 @@ function mapActivePlanDraftToTurn(args: {
     text: displayFields.text,
     status: plan.status,
     controlState: plan.control_state ?? 'none',
+    launchRequested: Boolean(plan.launch_requested),
     turnIndex,
     left: areaLeft,
     right: areaRight,

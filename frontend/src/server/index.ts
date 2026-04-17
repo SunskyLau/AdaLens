@@ -51,6 +51,7 @@ import {
 import { ensureRunProcessForSteer } from './resumeRun';
 import {
   applyPlanControlToPlanRecord,
+  applyPlanControlPreviewToPlanRecord,
   buildPlanControlResponse,
   type PlanRecord,
 } from './planControl';
@@ -450,6 +451,12 @@ function normalizeStateForClient(state: Record<string, unknown>): Record<string,
         : insight.atomic_insights;
       return {
         ...insight,
+        parent_insight_id:
+          typeof insight.parent_insight_id === 'string'
+            ? insight.parent_insight_id
+            : Array.isArray(insight.parent_lineage_refs) && typeof insight.parent_lineage_refs[0] === 'string'
+              ? insight.parent_lineage_refs[0]
+              : insight.parent_insight_id,
         summary:
           typeof insight.summary === 'string'
             ? normalizeCjkTerminalPunctuation(insight.summary)
@@ -572,16 +579,24 @@ async function writeRunState(runId: string, state: Record<string, unknown>): Pro
 }
 
 function normalizePlanRecord(plan: PlanRecord): PlanRecord {
+  const normalizedControlState =
+    plan.control_state === 'yield_requested'
+      ? 'pause_requested'
+      : typeof plan.control_state === 'string'
+        ? plan.control_state
+        : 'none';
   return {
     ...plan,
-    control_state:
-      typeof plan.control_state === 'string' ? plan.control_state : 'none',
+    control_state: normalizedControlState,
+    launch_requested: Boolean(plan.launch_requested),
     resume_phase:
       plan.resume_phase === 'analyzing' || plan.resume_phase === 'summarizing'
         ? plan.resume_phase
         : null,
     checkpoint_path:
       typeof plan.checkpoint_path === 'string' ? plan.checkpoint_path : null,
+    pending_modified_text:
+      typeof plan.pending_modified_text === 'string' ? plan.pending_modified_text : null,
   };
 }
 
@@ -596,9 +611,9 @@ function getStatePlans(state: Record<string, unknown>): PlanRecord[] {
 
 function isPlanControlAction(value: unknown): value is PlanControlAction {
   return (
-    value === 'start'
+    value === 'launch'
     || value === 'pause'
-    || value === 'resume'
+    || value === 'modify'
     || value === 'terminate'
   );
 }
@@ -806,7 +821,7 @@ app.post('/api/runs/start', async (req, res) => {
       const text = data.toString();
       stdoutChunks.push(text);
       ingestRunIdHint(text);
-      const tag = runId || 'pending-run';
+      const tag = runId || hintedRunId || 'pending-run';
       console.log(`[${tag}] stdout:`, text.trim());
     });
 
@@ -814,7 +829,7 @@ app.post('/api/runs/start', async (req, res) => {
       const text = data.toString();
       stderrChunks.push(text);
       ingestRunIdHint(text);
-      const tag = runId || 'pending-run';
+      const tag = runId || hintedRunId || 'pending-run';
       console.error(`[${tag}] stderr:`, text.trim());
     });
 
@@ -1120,11 +1135,6 @@ app.patch('/api/runs/:runId/settings', async (req, res) => {
     state.updated_at = timestamp;
 
     await writeRunState(runId, state);
-    await appendJsonlLine(path.join(RUNS_DIR, runId, 'runtime_controls.jsonl'), {
-      action: 'update_settings',
-      default_sub_agents_num: nextSettings.default_sub_agents_num,
-      timestamp,
-    });
 
     res.json({
       run_id: runId,
@@ -1141,9 +1151,12 @@ app.post('/api/runs/:runId/plans/:planId/control', async (req, res) => {
     const { runId, planId } = req.params;
     const action = isRecord(req.body) ? req.body.action : undefined;
     if (!isPlanControlAction(action)) {
-      res.status(400).json({ error: 'action must be one of start, pause, resume, terminate' });
+      res.status(400).json({ error: 'action must be one of launch, pause, modify, terminate' });
       return;
     }
+    const userAuthoredText = isRecord(req.body) && typeof req.body.user_authored_text === 'string'
+      ? req.body.user_authored_text
+      : undefined;
 
     const state = await readRunState(runId);
     if (!state) {
@@ -1172,8 +1185,8 @@ app.post('/api/runs/:runId/plans/:planId/control', async (req, res) => {
     }
 
     if (
-      (action === 'start' && plan.status === 'pending')
-      || (action === 'resume' && (plan.status === 'paused' || plan.status === 'pending'))
+      (action === 'launch' || action === 'modify')
+      && (plan.status === 'paused' || plan.status === 'pending')
     ) {
       const existingProcess = runningProcesses.get(runId);
       const persistedProcessStatus = await getPersistedRunProcessStatus(RUNS_DIR, runId);
@@ -1196,10 +1209,26 @@ app.post('/api/runs/:runId/plans/:planId/control', async (req, res) => {
     await appendJsonlLine(planControlsPath, {
       plan_id: planId,
       action,
+      ...(userAuthoredText ? { user_authored_text: userAuthoredText } : {}),
       timestamp,
     });
 
     const refreshedState = (await readRunState(runId)) ?? state;
+    const optimisticState = structuredClone(refreshedState);
+    const optimisticPlans =
+      (Array.isArray(optimisticState.frontier) ? optimisticState.frontier : null)
+      ?? (Array.isArray(optimisticState.plans) ? optimisticState.plans : null)
+      ?? [];
+    const optimisticPlanIndex = optimisticPlans.findIndex(
+      (item) => isRecord(item) && String(item.plan_id ?? '') === planId
+    );
+    if (optimisticPlanIndex >= 0) {
+      optimisticPlans[optimisticPlanIndex] = applyPlanControlPreviewToPlanRecord({
+        plan: normalizePlanRecord(optimisticPlans[optimisticPlanIndex] as PlanRecord),
+        action,
+        userAuthoredText,
+      });
+    }
     const refreshedPlan = getStatePlans(refreshedState)
       .find((item) => String(item.plan_id ?? '') === planId)
       ?? normalizePlanRecord({ ...plan });
@@ -1207,13 +1236,14 @@ app.post('/api/runs/:runId/plans/:planId/control', async (req, res) => {
       plan: refreshedPlan,
       action,
       persistedRunStatus:
-        typeof refreshedState.status === 'string' ? refreshedState.status : 'pending',
+        typeof optimisticState.status === 'string' ? optimisticState.status : 'pending',
+      userAuthoredText,
     });
 
     res.json({
       plan: responsePayload.plan,
       run_status: responsePayload.runStatus,
-      run_state: normalizeStateForClient(refreshedState),
+      run_state: normalizeStateForClient(optimisticState),
     });
   } catch (error) {
     console.error('Error controlling plan:', error);
@@ -1223,91 +1253,26 @@ app.post('/api/runs/:runId/plans/:planId/control', async (req, res) => {
 
 app.post('/api/runs/:runId/report', async (req, res) => {
   try {
-    const { runId } = req.params;
     const body = req.body as GenerateReportRequest;
-
-    const existingState = await readRunState(runId);
-    if (existingState) {
-      const legacy = detectLegacyState(existingState);
-      if (legacy.is_legacy) {
-        res.status(409).json({ error: 'Legacy run is not supported', reason: legacy.reason });
-        return;
-      }
-    }
 
     if (!body.insight_id) {
       res.status(400).json({ error: 'insight_id is required' });
       return;
     }
 
-    const reporterCliPath = path.join(BACKEND_DIR, 'reporter_cli.py');
-    try {
-      const stats = await fs.stat(reporterCliPath);
-      if (!stats.isFile()) {
-        throw new Error('reporter_cli.py is not a file');
-      }
-    } catch {
-      res.status(501).json({ error: 'Report generation is not available in this backend' });
-      return;
-    }
-
-    const args = [
-      '-u',
-      'reporter_cli.py',
-      '--run-id',
-      runId,
-      '--insight-id',
-      body.insight_id,
-    ];
-    if (body.force) {
-      args.push('--force');
-    }
-    if (body.language) {
-      args.push('--language', body.language);
-    }
-
-    console.log('\n[RunGateway] Generating report:', args);
-
-    const pythonProcess = spawn('python', args, {
-      cwd: BACKEND_DIR,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: buildBackendProcessEnv(),
+    res.json({
+      ok: true,
+      insight_id: body.insight_id,
+      report_path: '',
+      report_pack_path: '',
+      chain_insight_ids: [],
+      created_at: new Date().toISOString(),
+      language: body.language || 'en',
+      mode: 'unavailable',
+      segment_count: 0,
+      errors: [],
+      preview: '',
     });
-
-    const stdoutChunks: string[] = [];
-    const stderrChunks: string[] = [];
-
-    pythonProcess.stdout?.on('data', (data) => stdoutChunks.push(data.toString()));
-    pythonProcess.stderr?.on('data', (data) => stderrChunks.push(data.toString()));
-
-    const exitCode = await new Promise<number>((resolve) => {
-      pythonProcess.on('close', (code) => resolve(code ?? 1));
-    });
-
-    const stdout = stdoutChunks.join('');
-    const stderr = stderrChunks.join('');
-
-    // reporter_cli prints one JSON object per run; tolerate extra lines by parsing last JSON-looking line.
-    const lines = stdout.split('\n').map((l) => l.trim()).filter(Boolean);
-    const lastLine = lines.length ? lines[lines.length - 1] : '';
-    let parsed: unknown = null;
-    try {
-      parsed = JSON.parse(lastLine);
-    } catch {
-      parsed = null;
-    }
-
-    if (exitCode === 0 && parsed && typeof parsed === 'object' && (parsed as { ok?: unknown }).ok === true) {
-      res.json(parsed);
-      return;
-    }
-
-    const parsedError =
-      parsed && typeof parsed === 'object' ? (parsed as { error?: unknown }).error : null;
-    const errorMessage =
-      (typeof parsedError === 'string' && parsedError) ||
-      (stderr.trim() || stdout.trim() || `Report generation failed with exit code ${exitCode}`);
-    res.status(500).json({ error: errorMessage });
   } catch (error) {
     console.error('Error generating report:', error);
     res.status(500).json({ error: 'Failed to generate report' });

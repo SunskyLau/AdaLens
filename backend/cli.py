@@ -8,11 +8,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import signal
 import sys
 from pathlib import Path
 
-from config import DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_INITIAL_PLANS
+from config import (
+    CREATE_PLANS_REPLAY_ENV,
+    DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_MAX_INITIAL_PLANS,
+)
 from framework import MasterAgent, RunSettings, RunStore, UserMessage
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -44,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENCY)
     parser.add_argument("--max-concurrency", dest="max_concurrent", type=int)
     parser.add_argument("--max-initial-plans", type=int, default=DEFAULT_MAX_INITIAL_PLANS)
+    parser.add_argument(
+        "--replay",
+        action="store_true",
+        help="Enable development-only create_plans replay via backend/cache.json.",
+    )
     parser.add_argument(
         "--stable",
         dest="stable_output",
@@ -104,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
         store=store,
         settings=settings,
         max_initial_plans=args.max_initial_plans,
+        create_plans_replay_enabled=(
+            args.replay or os.environ.get(CREATE_PLANS_REPLAY_ENV, "").strip() == "1"
+        ),
         progress_callback=_print_progress,
     )
 

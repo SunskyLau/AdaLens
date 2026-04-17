@@ -14,6 +14,13 @@ npm run dev -- --replay
 The launcher forwards `AGENTIC_EDA_CREATE_PLANS_REPLAY=1` to the backend server
 process only.
 
+Direct backend CLI usage may also enable replay explicitly:
+
+```bash
+cd backend
+python cli.py --dataset ../data/vgsales.csv --user-goal "Summarize the dataset." --replay
+```
+
 Replay can be combined with stable backend sampling controls:
 
 ```bash
@@ -41,8 +48,9 @@ The file uses a simple JSON object:
 
 The backend does not store a separate replay counter.
 
-Instead, `_tool_create_plans` counts how many historical timeline entries already
-have `entry_type == "create_plans"` across `RunState.turns`, then uses
+Instead, the implementation-aligned runtime counts how many historical timeline
+entries already have `entry_type == "create_plans"` in persisted run timeline
+state, then uses
 `count + 1` as the current call index.
 
 Because timeline entries are already persisted in run state, the same indexing

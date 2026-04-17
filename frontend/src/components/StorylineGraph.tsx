@@ -656,7 +656,7 @@ export default function StorylineGraph({
       return count;
     }, 0);
   }, [runState]);
-  const disablePendingPlanStart = activeExecutionSeatCount >= maxPlanConcurrency;
+  const disablePendingPlanLaunch = activeExecutionSeatCount >= maxPlanConcurrency;
   const modifierPlatform = useMemo(() => {
     if (typeof navigator === 'undefined') {
       return resolveStorylineModifierPlatform(null);
@@ -2104,7 +2104,15 @@ export default function StorylineGraph({
       return;
     }
     const plan = runState.frontier.find((item) => item.plan_id === planId);
-    if (!plan || (plan.status !== 'pending' && plan.status !== 'paused')) {
+    if (
+      !plan
+      || (
+        plan.status !== 'pending'
+        && plan.status !== 'paused'
+        && plan.status !== 'analyzing'
+        && plan.status !== 'summarizing'
+      )
+    ) {
       return;
     }
     setEditingPlanState({
@@ -2143,11 +2151,38 @@ export default function StorylineGraph({
     const currentPlan =
       useStore.getState().runState?.frontier.find((plan) => plan.plan_id === planId)
       ?? runState.frontier.find((plan) => plan.plan_id === planId);
-    if (!currentPlan || (currentPlan.status !== 'pending' && currentPlan.status !== 'paused')) {
+    if (
+      !currentPlan
+      || (
+        currentPlan.status !== 'pending'
+        && currentPlan.status !== 'paused'
+        && currentPlan.status !== 'analyzing'
+        && currentPlan.status !== 'summarizing'
+      )
+    ) {
       setEditingPlanState(null);
       return;
     }
-    setEditingPlanState(null);
+    setPlanControlPendingById((current) => ({ ...current, [planId]: 'modify' }));
+    try {
+      const response = await controlPlan(runState.run_id, planId, 'modify', {
+        userAuthoredText: nextText,
+      });
+      setEditingPlanState(null);
+      if (response.run_state) {
+        setRunState(response.run_state);
+      } else {
+        applyPlanToRunState(runState.run_id, response.plan, response.run_status);
+      }
+    } catch (error) {
+      console.error('Failed to modify plan:', error);
+    } finally {
+      setPlanControlPendingById((current) => {
+        const next = { ...current };
+        delete next[planId];
+        return next;
+      });
+    }
   };
 
   const handlePlanControl = async (planId: string, action: PlanControlAction) => {
@@ -2670,7 +2705,7 @@ export default function StorylineGraph({
         planControlPendingById={planControlPendingById}
         editingPlanId={editingPlanState?.planId ?? null}
         editingPlanDraft={editingPlanState?.draft ?? ''}
-        disablePendingPlanStart={disablePendingPlanStart}
+        disablePendingPlanLaunch={disablePendingPlanLaunch}
         onCanvasMouseDown={handleCanvasMouseDown}
         onCanvasClick={handleCanvasClick}
         onCanvasMouseLeave={handleCanvasMouseLeave}

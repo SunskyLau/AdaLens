@@ -59,9 +59,11 @@ export interface PlanItem {
   parent_insight_id: string | null;
   short_label?: string;
   assigned_sub_agent_id?: string | null;
-  control_state?: 'none' | 'pause_requested' | 'terminate_requested' | 'yield_requested';
+  control_state?: 'none' | 'pause_requested' | 'terminate_requested';
   resume_phase?: 'analyzing' | 'summarizing' | null;
   checkpoint_path?: string | null;
+  pending_modified_text?: string | null;
+  launch_requested?: boolean;
   final_summary?: string | null;
   error_message?: string | null;
   created_at: string;
@@ -160,6 +162,7 @@ export interface Summary {
   atomic_insights: AtomicInsight[];
   keywords?: string[];
   embedding?: number[] | null;
+  parent_lineage_refs?: string[];
   parent_insight_id: string | null;
   children_insight_ids?: string[]; // Legacy/client-synthesized lineage only.
   short_label?: string;

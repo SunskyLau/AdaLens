@@ -124,7 +124,7 @@ interface StorylineGraphSceneProps {
   planControlPendingById: Record<string, PlanControlAction | null>;
   editingPlanId?: string | null;
   editingPlanDraft?: string;
-  disablePendingPlanStart?: boolean;
+  disablePendingPlanLaunch?: boolean;
   onCanvasMouseDown: any;
   onCanvasClick: any;
   onCanvasMouseLeave: () => void;
@@ -238,7 +238,7 @@ export default function StorylineGraphScene(props: StorylineGraphSceneProps) {
     planControlPendingById,
     editingPlanId = null,
     editingPlanDraft = '',
-    disablePendingPlanStart = false,
+    disablePendingPlanLaunch = false,
     onCanvasMouseDown,
     onCanvasClick,
     onCanvasMouseLeave,
@@ -1287,6 +1287,7 @@ export default function StorylineGraphScene(props: StorylineGraphSceneProps) {
               short_label: area.shortLabel,
               status: area.status,
               control_state: area.controlState,
+              launch_requested: area.launchRequested,
             };
             return (
               <div
@@ -1324,7 +1325,7 @@ export default function StorylineGraphScene(props: StorylineGraphSceneProps) {
                   plan={planCardState}
                   selected={isSelected}
                   pendingAction={pendingAction}
-                  disableStartControl={disablePendingPlanStart}
+                  disablePendingLaunchControl={disablePendingPlanLaunch}
                   variant="storyline"
                   accentVariant={isCreateOrigin ? 'create' : 'default'}
                   hidePlanText={!showActivePlanText}

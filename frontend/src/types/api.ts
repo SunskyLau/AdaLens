@@ -67,7 +67,7 @@ export interface StopRunResponse {
   error?: string;
 }
 
-export type PlanControlAction = 'start' | 'pause' | 'resume' | 'terminate';
+export type PlanControlAction = 'launch' | 'pause' | 'terminate' | 'modify';
 
 export interface SteerRunRequest {
   content: string;

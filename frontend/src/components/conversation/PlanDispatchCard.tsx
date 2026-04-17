@@ -16,7 +16,7 @@ import type { PlanControlAction, PlanItem } from '@/types';
 
 type PlanCardPlan = Pick<
   PlanItem,
-  'plan_id' | 'text' | 'short_label' | 'status' | 'control_state'
+  'plan_id' | 'text' | 'short_label' | 'status' | 'control_state' | 'launch_requested'
 >;
 
 export function isActivePlanStatus(status: PlanItem['status'] | undefined): boolean {
@@ -65,6 +65,14 @@ export function isPlanModifySubmitKey(args: {
 
 export function PlanStatusBadge({ plan }: { plan: PlanCardPlan | undefined }) {
   const displayStatus = resolveDisplayStatus(plan);
+  if (displayStatus === 'pending' && plan?.launch_requested) {
+    return (
+      <span className="inline-flex h-5 shrink-0 items-center gap-1 rounded-md bg-sky-100 px-2 text-[11px] font-medium leading-none text-sky-800">
+        <Play className="h-3 w-3 fill-current" />
+        launch requested
+      </span>
+    );
+  }
   switch (displayStatus) {
     case 'paused':
       return (
@@ -164,21 +172,19 @@ function PlanControlIconButton({
   const icon =
     action === 'pause'
       ? <Pause className="h-3 w-3" />
-      : action === 'resume' || action === 'start'
+      : action === 'launch'
         ? <Play className="h-3 w-3 fill-current" />
         : <Square className="h-3 w-3 fill-current" />;
   const label =
     action === 'pause'
       ? 'Pause'
-      : action === 'resume'
-        ? 'Resume'
-        : action === 'start'
-          ? 'Start'
-          : 'Terminate';
+      : action === 'launch'
+        ? 'Launch'
+        : 'Terminate';
   const classes =
     action === 'pause'
       ? 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-      : action === 'resume' || action === 'start'
+      : action === 'launch'
         ? 'bg-sky-100 text-sky-700 hover:bg-sky-200'
         : 'bg-rose-100 text-rose-700 hover:bg-rose-200';
   return (
@@ -198,8 +204,8 @@ export default function PlanDispatchCard({
   selected = false,
   elapsedSeconds,
   pendingAction = null,
-  disableStartControl = false,
-  disableResumeControl = false,
+  disablePendingLaunchControl = false,
+  disablePausedLaunchControl = false,
   variant = 'chat',
   accentVariant = 'default',
   hidePlanText = false,
@@ -223,8 +229,8 @@ export default function PlanDispatchCard({
   selected?: boolean;
   elapsedSeconds?: number;
   pendingAction?: PlanControlAction | null;
-  disableStartControl?: boolean;
-  disableResumeControl?: boolean;
+  disablePendingLaunchControl?: boolean;
+  disablePausedLaunchControl?: boolean;
   variant?: 'chat' | 'storyline';
   accentVariant?: 'default' | 'create';
   hidePlanText?: boolean;
@@ -246,18 +252,20 @@ export default function PlanDispatchCard({
   const displayStatus = resolveDisplayStatus(plan);
   const isStorylineVariant = variant === 'storyline';
   const canModify = displayStatus === 'pending' || displayStatus === 'paused';
-  const canStart = displayStatus === 'pending';
+  const canModifyActive = displayStatus === 'analyzing' || displayStatus === 'summarizing';
+  const canModifyAny = canModify || canModifyActive;
+  const canLaunchPending = displayStatus === 'pending';
   const canPause = displayStatus === 'analyzing' || displayStatus === 'summarizing';
-  const canResume = displayStatus === 'paused';
+  const canLaunchPaused = displayStatus === 'paused';
   const canTerminate =
     displayStatus === 'pending'
     || displayStatus === 'paused'
     || displayStatus === 'analyzing'
     || displayStatus === 'summarizing';
   const isPauseDrainPending = displayStatus === 'paused' && plan?.control_state === 'pause_requested';
-  const disableStartOrPause = isEditing || pendingAction !== null || plan?.control_state !== 'none';
-  const disableStart = disableStartControl || disableStartOrPause;
-  const disableResume = disableResumeControl
+  const disableLaunchOrPause = isEditing || pendingAction !== null || plan?.control_state !== 'none';
+  const disablePendingLaunch = disablePendingLaunchControl || disableLaunchOrPause || Boolean(plan?.launch_requested);
+  const disablePausedLaunch = disablePausedLaunchControl
     || isEditing
     || pendingAction !== null
     || (plan?.control_state !== 'none' && !isPauseDrainPending);
@@ -267,7 +275,7 @@ export default function PlanDispatchCard({
   );
   const disableModify = isEditing
     ? pendingAction !== null || modifyDraft.trim().length === 0
-    : pendingAction !== null || disableModifyControl || !canModify;
+    : pendingAction !== null || disableModifyControl || !canModifyAny;
   const isCreateAccent = accentVariant === 'create';
   const isExecuting = isStorylineVariant && isActivePlanStatus(displayStatus);
   const rootClasses = [
@@ -374,24 +382,24 @@ export default function PlanDispatchCard({
                   }}
                 />
               ) : null}
-              {canStart ? (
+              {canLaunchPending ? (
                 <PlanControlIconButton
-                  action="start"
-                  disabled={disableStart}
+                  action="launch"
+                  disabled={disablePendingLaunch}
                   onClick={onControl}
                 />
               ) : null}
               {canPause ? (
                 <PlanControlIconButton
                   action="pause"
-                  disabled={disableStartOrPause}
+                  disabled={disableLaunchOrPause}
                   onClick={onControl}
                 />
               ) : null}
-              {canResume ? (
+              {canLaunchPaused ? (
                 <PlanControlIconButton
-                  action="resume"
-                  disabled={disableResume}
+                  action="launch"
+                  disabled={disablePausedLaunch}
                   onClick={onControl}
                 />
               ) : null}

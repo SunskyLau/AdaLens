@@ -103,7 +103,13 @@ logs/
 .temp/
 .codex-temp-test*/
 backend/.codex-temp-test*/
+frontend/test/
+backend/test/
 
-# Data files (optional - uncomment if you don't want to track data)
-# data/*.csv
-# data/*.json
+# Data files
+data/*.csv
+data/*.json
+
+# Debug & Tests
+debug/
+pyrightconfig.json

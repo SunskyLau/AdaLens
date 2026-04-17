@@ -10,6 +10,7 @@
 import { create, type StoreApi, type UseBoundStore } from 'zustand';
 import type {
   ConversationEntry,
+  DispatchBatchState,
   RunState,
   Event,
   PlanItem,
@@ -147,7 +148,24 @@ function appendConversationEntry(
 ): ConversationEntry[] {
   const existingIndex = existingEntries.findIndex((item) => item.id === entry.id);
   if (existingIndex >= 0) {
-    return existingEntries.map((item, index) => (index === existingIndex ? entry : item));
+    return existingEntries.map((item, index) => {
+      if (index !== existingIndex) {
+        return item;
+      }
+      if (item.type === 'plans_dispatched' && entry.type === 'plans_dispatched') {
+        const existingPlanIds = Array.isArray(item.planIds) ? item.planIds : [];
+        const incomingPlanIds = Array.isArray(entry.planIds) ? entry.planIds : [];
+        return {
+          ...entry,
+          timestamp: item.timestamp,
+          planIds: [
+            ...existingPlanIds,
+            ...incomingPlanIds.filter((planId) => !existingPlanIds.includes(planId)),
+          ],
+        };
+      }
+      return entry;
+    });
   }
 
   if (!shouldAppendConversationEntry(entry, existingEntries)) {
@@ -489,15 +507,19 @@ function upsertDispatchBatchFromToolResult(
   const existingIndex = batches.findIndex(
     (batch) => batch.dispatch_turn_index === dispatchTurnIndex
   );
+  const mergeBatchPlanIds = (
+    existingPlanIds: string[],
+    incomingPlanIds: string[]
+  ): string[] => [
+    ...existingPlanIds,
+    ...incomingPlanIds.filter((planId) => !existingPlanIds.includes(planId)),
+  ];
   const mergedPlanIds =
-    existingIndex >= 0 && explicitPlanIds == null
-      ? [
-          ...batches[existingIndex].plan_ids,
-          ...dispatchedPlanIds.filter((planId) => !batches[existingIndex].plan_ids.includes(planId)),
-        ]
+    existingIndex >= 0
+      ? mergeBatchPlanIds(batches[existingIndex].plan_ids, nextPlanIds)
       : nextPlanIds;
 
-  const nextBatches =
+  const nextBatches: DispatchBatchState[] =
     existingIndex >= 0
       ? batches.map((batch, index) =>
           index !== existingIndex
@@ -660,10 +682,12 @@ function projectRunStateWithEvent(
 
     case 'master_agent_tool_result': {
       const data = event.data as { tool_name?: string; result?: Record<string, unknown> };
-      if (data.tool_name === 'mark_complete') {
+      if (data.tool_name === 'mark_complete' || data.tool_name === 'emit_final_report') {
         const summary =
-          typeof data.result?.summary === 'string'
-            ? normalizeCjkTerminalPunctuation(data.result.summary)
+          typeof data.result?.final_report === 'string'
+            ? normalizeCjkTerminalPunctuation(data.result.final_report)
+            : typeof data.result?.summary === 'string'
+              ? normalizeCjkTerminalPunctuation(data.result.summary)
             : runState.final_summary ?? '';
         if (summary.trim()) {
           nextRunState = applyMarkCompleteToRunState(runState, summary);
@@ -723,12 +747,36 @@ function normalizePlanItem(plan: PlanItem): PlanItem {
     control_state: plan.control_state ?? 'none',
     resume_phase: plan.resume_phase ?? null,
     checkpoint_path: plan.checkpoint_path ?? null,
+    launch_requested: Boolean(plan.launch_requested),
     assigned_sub_agent_id: plan.assigned_sub_agent_id ?? null,
     final_summary:
       typeof plan.final_summary === 'string'
         ? normalizeCjkTerminalPunctuation(plan.final_summary)
         : null,
     error_message: plan.error_message ?? null,
+  };
+}
+
+function normalizeOptionalErrorMessage(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (['none', 'null', 'undefined'].includes(trimmed.toLowerCase())) {
+    return null;
+  }
+  return trimmed;
+}
+
+function normalizeExecutionRecord(record: ExecutionRecord): ExecutionRecord {
+  return {
+    ...record,
+    stdout_content: typeof record.stdout_content === 'string' ? record.stdout_content : '',
+    stderr_content: typeof record.stderr_content === 'string' ? record.stderr_content : '',
+    error_message: normalizeOptionalErrorMessage(record.error_message),
   };
 }
 
@@ -787,6 +835,7 @@ function normalizeRunState(runState: RunState): RunState {
         : undefined,
     },
     user_messages: (runState.user_messages ?? []).map(normalizeUserMessage),
+    execution_records: (runState.execution_records ?? []).map(normalizeExecutionRecord),
     final_summary: normalizeCjkTerminalPunctuation(runState.final_summary ?? ''),
   };
 }
@@ -897,33 +946,39 @@ function buildConversationEntry(
         };
       }
       if (data.tool_name === 'dispatch_plans') {
+        const dispatchTurnIndex =
+          typeof result.dispatch_turn_index === 'number' ? result.dispatch_turn_index : undefined;
         const planIds = Array.isArray(result.plan_ids)
           ? result.plan_ids.map((item) => String(item))
           : Array.isArray(result.dispatched_plan_ids)
             ? result.dispatched_plan_ids.map((item) => String(item))
             : [];
         return {
-          id: `${event.timestamp}:plans_dispatched`,
+          id:
+            typeof dispatchTurnIndex === 'number'
+              ? `dispatch-batch:${dispatchTurnIndex}`
+              : `${event.timestamp}:plans_dispatched`,
           type: 'plans_dispatched',
           timestamp: event.timestamp,
           planIds,
-          dispatchTurnIndex:
-            typeof result.dispatch_turn_index === 'number' ? result.dispatch_turn_index : undefined,
+          dispatchTurnIndex,
         };
       }
       if (data.tool_name === 'evaluate_progress') {
         return null;
       }
-      if (data.tool_name === 'synthesize_findings') {
+      if (data.tool_name === 'synthesize_findings' || data.tool_name === 'emit_stage_synthesis') {
         return null;
       }
-      if (data.tool_name === 'respond_to_user') {
+      if (data.tool_name === 'respond_to_user' || data.tool_name === 'emit_response') {
         return null;
       }
-      if (data.tool_name === 'mark_complete') {
+      if (data.tool_name === 'mark_complete' || data.tool_name === 'emit_final_report') {
         const summary =
-          typeof result.summary === 'string'
-            ? normalizeCjkTerminalPunctuation(result.summary)
+          typeof result.final_report === 'string'
+            ? normalizeCjkTerminalPunctuation(result.final_report)
+            : typeof result.summary === 'string'
+              ? normalizeCjkTerminalPunctuation(result.summary)
             : '';
         if (!summary.trim()) {
           return null;
@@ -953,11 +1008,22 @@ function buildConversationEntry(
       const markdownBody = normalizeCjkTerminalPunctuation(
         data.stage_summary_markdown ?? data.evaluation ?? ''
       );
+      const evaluationText = normalizeCjkTerminalPunctuation(data.evaluation ?? markdownBody);
+      const hasStageSummaryMarkdown = typeof data.stage_summary_markdown === 'string'
+        && data.stage_summary_markdown.trim().length > 0;
+      if (!hasStageSummaryMarkdown) {
+        return {
+          id: `${event.timestamp}:synthesis`,
+          type: 'synthesis',
+          timestamp: event.timestamp,
+          text: evaluationText,
+        };
+      }
       return {
         id: `${event.timestamp}:evaluation`,
         type: 'evaluation',
         timestamp: event.timestamp,
-        text: normalizeCjkTerminalPunctuation(data.evaluation ?? markdownBody),
+        text: evaluationText,
         markdownBody,
         dispatchTurnIndex:
           typeof data.dispatch_turn_index === 'number' ? data.dispatch_turn_index : undefined,
@@ -1053,6 +1119,12 @@ function applyProgressEvaluationToRunState(
   const dispatchTurnIndex =
     typeof payload.dispatch_turn_index === 'number' ? payload.dispatch_turn_index : null;
   if (dispatchTurnIndex === null) {
+    return runState;
+  }
+  const hasStageSummaryMarkdown =
+    typeof payload.stage_summary_markdown === 'string'
+    && payload.stage_summary_markdown.trim().length > 0;
+  if (!hasStageSummaryMarkdown) {
     return runState;
   }
   const coveredDispatchTurnIndexes = new Set(
@@ -1523,7 +1595,14 @@ export const useStore: UseBoundStore<StoreApi<AppState>> = create<AppState>((set
   
   getExecutionByPlanId: (planId) => {
     const { runState } = get();
-    return runState?.execution_records.find(e => e.plan_id === planId);
+    const records = runState?.execution_records ?? [];
+    for (let index = records.length - 1; index >= 0; index -= 1) {
+      const record = records[index];
+      if (record?.plan_id === planId) {
+        return record;
+      }
+    }
+    return undefined;
   },
   
   getInsightTree: () => {
