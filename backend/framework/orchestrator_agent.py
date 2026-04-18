@@ -218,8 +218,11 @@ def _build_orchestrator_augmentation_prompt() -> str:
         "- When an elaborate steering is active, keep follow-up tightly scoped to that one insight. If multiple tightly coupled explanations or mechanism checks are still needed, 2-3 coordinated follow-up plans are allowed, but avoid unrelated branching.\n"
         "- Prefer plans that differ by analytical angle, mechanism, validation path, or evidence strategy. If multiple candidate plans overlap heavily, keep the more complementary decomposition.\n"
         "- Reuse rich derived context as a deliberation brief: read the narrative sections to understand uncovered follow-ups, already-covered angles, and where current plan coverage is still too flat.\n"
+        "- If a new user-authored input has not yet been acknowledged, one concise `emit_response` may be appropriate before other work, but that acknowledgement does not by itself complete scheduling or execution handoff.\n"
         "- When the latest user-authored input is a direct question, a follow-up, or a progress/explanation request, and the current state already supports a grounded short explanation, consider `emit_response` instead of silent waiting.\n"
         "- When a dispatch batch has just finished or a stage synthesis has just been emitted, a concise `emit_response` can be appropriate if it helps the user understand what just happened and what the likely next step is.\n"
+        "- If `dispatch_ready` is still present, or runnable pending/paused work remains with no active worker, treat scheduling as still outstanding even if a prior round already emitted a response.\n"
+        "- Do not infer that work has already started merely because a batch exists or is marked dispatched; confirm worker activity from active plans / active workers before choosing to wait for execution.\n"
         "- Review-ready signals indicate that another deliberation round is worthwhile; they do not require continuation, and `wait` remains valid when no materially useful action is justified.\n"
         "- Avoid repetitive acknowledgement loops. If a review-ready signal wakes a new round but there is no new substantive explanation or follow-up work to do, prefer `wait` over another redundant `emit_response`.\n"
     )
@@ -582,11 +585,21 @@ def _response_opportunity_hints(run_state: RunState) -> dict[str, Any]:
     ) and any(
         batch.status == "waiting_for_stage_summary" for batch in run_state.batches
     )
+    dispatch_ready_present = any(
+        str(getattr(entry, "entry_type", "") or "") == "dispatch_ready"
+        for entry in recent_signals
+    )
+    runnable_without_active_worker = bool(
+        any(plan.status in {"pending", "paused"} for plan in run_state.plans)
+        and not any(plan.status in {"analyzing", "summarizing"} for plan in run_state.plans)
+    )
     recent_batch_finished_has_retained_findings = bool(recent_batch_finished and run_state.findings)
     response_should_not_preempt_higher_priority_action = bool(
         launch_priority_present
         or waiting_for_stage_summary_present
         or no_plan_and_goal_needs_expansion
+        or dispatch_ready_present
+        or runnable_without_active_worker
     )
 
     advisory_notes: list[str] = []
@@ -606,6 +619,14 @@ def _response_opportunity_hints(run_state: RunState) -> dict[str, Any]:
         advisory_notes.append(
             "A dispatch batch appears to have just finished with retained findings. A short emit_response can help bridge from results to the next deliberate move."
         )
+    if dispatch_ready_present:
+        advisory_notes.append(
+            "A dispatch_ready signal is still present. If you emit a response now, scheduling may still be the next materially useful step afterward."
+        )
+    if runnable_without_active_worker:
+        advisory_notes.append(
+            "Runnable pending or paused work remains but no worker is active. Do not treat prior acknowledgement as proof that execution handoff is complete."
+        )
     if response_should_not_preempt_higher_priority_action:
         advisory_notes.append(
             "A higher-priority action may already be available. Do not force emit_response when dispatch, planning, or stage synthesis is clearly due."
@@ -620,6 +641,8 @@ def _response_opportunity_hints(run_state: RunState) -> dict[str, Any]:
         "latest_user_message_unacknowledged": latest_user_message_unacknowledged,
         "grounded_response_possible_from_existing_findings": grounded_response_possible_from_existing_findings,
         "response_should_not_preempt_higher_priority_action": response_should_not_preempt_higher_priority_action,
+        "dispatch_ready_present": dispatch_ready_present,
+        "runnable_without_active_worker": runnable_without_active_worker,
         "recent_batch_finished": recent_batch_finished,
         "recent_batch_finished_has_retained_findings": recent_batch_finished_has_retained_findings,
         "advisory_notes": advisory_notes,

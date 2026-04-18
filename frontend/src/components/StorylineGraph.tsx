@@ -2169,10 +2169,10 @@ export default function StorylineGraph({
         userAuthoredText: nextText,
       });
       setEditingPlanState(null);
-      if (response.run_state) {
-        setRunState(response.run_state);
-      } else {
+      if (response.plan) {
         applyPlanToRunState(runState.run_id, response.plan, response.run_status);
+      } else if (response.run_state) {
+        setRunState(response.run_state);
       }
     } catch (error) {
       console.error('Failed to modify plan:', error);
@@ -2198,10 +2198,10 @@ export default function StorylineGraph({
     setPlanControlPendingById((current) => ({ ...current, [planId]: action }));
     try {
       const response = await controlPlan(runState.run_id, planId, action);
-      if (response.run_state) {
-        setRunState(response.run_state);
-      } else {
+      if (response.plan) {
         applyPlanToRunState(runState.run_id, response.plan, response.run_status);
+      } else if (response.run_state) {
+        setRunState(response.run_state);
       }
     } catch (error) {
       console.error('Failed to control plan:', error);

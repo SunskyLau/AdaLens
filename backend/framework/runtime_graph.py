@@ -158,6 +158,23 @@ class RuntimeGraph:
             return
         self._pending_internal_signals.append(dict(signal))
 
+    def _materialize_pending_internal_signals(self) -> list[str]:
+        assert self.state is not None
+        signal_kinds: list[str] = []
+        while self._pending_internal_signals:
+            signal = self._pending_internal_signals.pop(0)
+            kind = str(signal.get("kind", "signal") or "signal")
+            signal_kinds.append(kind)
+            self.state.timeline.append(
+                TimelineEntry(
+                    entry_type=kind,
+                    content=signal,
+                )
+            )
+        if signal_kinds:
+            self.store.save_state(self.state)
+        return signal_kinds
+
     def _has_nonterminal_plans(self) -> bool:
         assert self.state is not None
         return any(
@@ -276,30 +293,20 @@ class RuntimeGraph:
                 )
                 return self.state
 
-            if self._pending_internal_signals:
-                signal_kinds = [
-                    str(signal.get("kind", "signal"))
-                    for signal in self._pending_internal_signals
-                ]
-                while self._pending_internal_signals:
-                    signal = self._pending_internal_signals.pop(0)
-                    self.state.timeline.append(
-                        TimelineEntry(
-                            entry_type=str(signal.get("kind", "signal")),
-                            content=signal,
-                        )
-                    )
-                self.store.save_state(self.state)
-                self._log(
-                    f"[runtime run={self._run_tag()}] wake=signal kinds={signal_kinds}"
-                )
-                return self.state
-
-            if await self._ingest_finished_workers():
-                return self.state
-
+            wake_reasons: list[str] = []
             if await self._ingest_runtime_inputs():
+                wake_reasons.append("input")
+            if self._pending_runtime_inputs:
                 self._apply_pending_runtime_inputs()
+            if await self._ingest_finished_workers():
+                wake_reasons.append("worker_update")
+            signal_kinds = self._materialize_pending_internal_signals()
+            if signal_kinds:
+                wake_reasons.extend(f"signal:{kind}" for kind in signal_kinds)
+            if wake_reasons:
+                self._log(
+                    f"[runtime run={self._run_tag()}] wake=materialized reasons={wake_reasons}"
+                )
                 return self.state
 
             stop_path = self.store.run_dir / RUN_CONTROL_STOP_FILE
@@ -385,6 +392,16 @@ class RuntimeGraph:
                     f"[runtime run={self._run_tag()}] signal=post_emit_response_review_ready "
                     f"reason={signal.get('reason')!r}"
                 )
+            if message_text and not self.worker_runtime.active_plan_ids():
+                dispatch_ready_signal = self._dispatch_ready_signal_for_runnable_plans(
+                    source_action="emit_response",
+                )
+                if dispatch_ready_signal is not None:
+                    self._enqueue_internal_signal(dispatch_ready_signal)
+                    self._log(
+                        f"[runtime run={self._run_tag()}] signal=dispatch_ready "
+                        f"plan_ids={dispatch_ready_signal.get('plan_ids', [])} source_action='emit_response'"
+                    )
             self.state.step += 1
             self.store.save_state(self.state)
             return self.state
@@ -810,7 +827,7 @@ class RuntimeGraph:
             if target_plan.status in {"analyzing", "summarizing"}:
                 target_plan.pending_modified_text = next_text
                 target_plan.control_state = "pause_requested"
-                target_plan.launch_requested = True
+                target_plan.launch_requested = False
             else:
                 self._apply_pending_modification(target_plan, next_text)
         self.store.log_plan_status_changed(target_plan)
@@ -892,6 +909,65 @@ class RuntimeGraph:
                 return batch
         return None
 
+    def _batch_for_plan(self, plan_id: str) -> DispatchBatchState | None:
+        assert self.state is not None
+        for batch in self.state.master_agent_state.dispatch_batches:
+            if plan_id in batch.plan_ids:
+                return batch
+        return None
+
+    def _normalize_dispatch_request_to_single_batch(
+        self,
+        requested_plan_ids: list[str],
+    ) -> tuple[DispatchBatchState | None, list[str]]:
+        ordered_requested = [str(plan_id or "").strip() for plan_id in requested_plan_ids if str(plan_id or "").strip()]
+        if not ordered_requested:
+            return None, []
+        first_plan_batch = self._batch_for_plan(ordered_requested[0])
+        if first_plan_batch is not None:
+            return (
+                first_plan_batch,
+                [plan_id for plan_id in ordered_requested if plan_id in first_plan_batch.plan_ids],
+            )
+        return (
+            None,
+            [plan_id for plan_id in ordered_requested if self._batch_for_plan(plan_id) is None],
+        )
+
+    def _dispatch_ready_signal_for_runnable_plans(
+        self,
+        requested_plan_ids: list[str] | None = None,
+        *,
+        source_action: str | None = None,
+    ) -> dict[str, Any] | None:
+        assert self.state is not None
+        raw_requested = [
+            str(plan_id or "").strip()
+            for plan_id in requested_plan_ids or []
+            if str(plan_id or "").strip()
+        ]
+        if raw_requested:
+            candidate_ids = [
+                plan_id
+                for plan_id in raw_requested
+                if (plan := self.state.get_plan_by_id(plan_id)) is not None
+                and plan.status in {"pending", "paused"}
+            ]
+        else:
+            candidate_ids = self._ordered_dispatch_candidates([])
+        target_batch, normalized_plan_ids = self._normalize_dispatch_request_to_single_batch(candidate_ids)
+        if not normalized_plan_ids:
+            return None
+        signal: dict[str, Any] = {
+            "kind": "dispatch_ready",
+            "plan_ids": normalized_plan_ids,
+        }
+        if target_batch is not None:
+            signal["dispatch_turn_index"] = target_batch.dispatch_turn_index
+        if source_action:
+            signal["source_action"] = source_action
+        return signal
+
     @staticmethod
     def _steering_target_key(steering: SteeringRequest) -> str:
         target = steering.target
@@ -961,12 +1037,16 @@ class RuntimeGraph:
             current_turn = self.state.current_turn()
             if current_turn is not None:
                 current_turn.dispatch_batches.append(batch)
-            self._pending_internal_signals.append(
-                {"kind": "dispatch_ready", "plan_ids": created_plan_ids}
+            dispatch_ready_signal = self._dispatch_ready_signal_for_runnable_plans(
+                created_plan_ids,
+                source_action="create_plans",
             )
-            self._log(
-                f"[runtime run={self._run_tag()}] signal=dispatch_ready plan_ids={created_plan_ids}"
-            )
+            if dispatch_ready_signal is not None:
+                self._enqueue_internal_signal(dispatch_ready_signal)
+                self._log(
+                    f"[runtime run={self._run_tag()}] signal=dispatch_ready "
+                    f"plan_ids={dispatch_ready_signal.get('plan_ids', [])}"
+                )
         self.store.save_state(self.state)
         return created
 
@@ -978,30 +1058,29 @@ class RuntimeGraph:
             if str(item)
         ]
         requested_plan_ids = self._ordered_dispatch_candidates(requested_plan_ids)
-        target_batch: DispatchBatchState | None = None
-        for batch in self.state.master_agent_state.dispatch_batches:
-            if any(plan_id in batch.plan_ids for plan_id in requested_plan_ids):
-                target_batch = batch
-        if target_batch is None and requested_plan_ids:
+        target_batch, normalized_plan_ids = self._normalize_dispatch_request_to_single_batch(
+            requested_plan_ids,
+        )
+        if target_batch is None and normalized_plan_ids:
             target_batch = DispatchBatchState(
                 dispatch_turn_index=len(self.state.master_agent_state.dispatch_batches),
-                plan_ids=list(requested_plan_ids),
-                waiting_plan_ids=list(requested_plan_ids),
+                plan_ids=list(normalized_plan_ids),
+                waiting_plan_ids=list(normalized_plan_ids),
             )
             self.state.master_agent_state.dispatch_batches.append(target_batch)
             current_turn = self.state.current_turn()
             if current_turn is not None:
                 current_turn.dispatch_batches.append(target_batch)
         elif target_batch is not None:
-            for plan_id in requested_plan_ids:
-                if plan_id not in target_batch.plan_ids:
-                    target_batch.plan_ids.append(plan_id)
-                if plan_id not in target_batch.waiting_plan_ids:
-                    target_batch.waiting_plan_ids.append(plan_id)
+            normalized_plan_ids = [
+                plan_id
+                for plan_id in normalized_plan_ids
+                if plan_id in target_batch.plan_ids
+            ]
         active_count = len(self.worker_runtime.active_plan_ids())
         available = max(0, self.settings.max_concurrency - active_count)
         dispatched: list[str] = []
-        for plan_id in requested_plan_ids:
+        for plan_id in normalized_plan_ids:
             if len(dispatched) >= available:
                 break
             plan = self.state.get_plan_by_id(plan_id)
@@ -1024,16 +1103,12 @@ class RuntimeGraph:
         if not dispatched:
             self._log(
                 f"[runtime run={self._run_tag()}] dispatch_plans no_dispatch "
-                f"requested={requested_plan_ids} available_slots={available}"
+                f"requested={normalized_plan_ids} available_slots={available}"
             )
         return {
-            "plan_ids": requested_plan_ids,
+            "plan_ids": normalized_plan_ids,
             "dispatched_plan_ids": dispatched,
-            "dispatch_turn_index": (
-                self.state.master_agent_state.dispatch_batches[-1].dispatch_turn_index
-                if self.state.master_agent_state.dispatch_batches
-                else 0
-            ),
+            "dispatch_turn_index": target_batch.dispatch_turn_index if target_batch is not None else 0,
         }
 
     def _build_plan_control_callback(self, plan_id: str) -> Callable[[], dict[str, Any]]:

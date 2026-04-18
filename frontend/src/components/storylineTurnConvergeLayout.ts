@@ -205,6 +205,7 @@ interface ActivePlanDraft {
   text: string;
   status: PlanItem['status'];
   controlState: NonNullable<PlanItem['control_state']>;
+  launchRequested: boolean;
   turnIndex: number;
   left: number;
   right: number;
@@ -1684,6 +1685,7 @@ function offsetActivePlanDraftY(
     text: draft.text,
     status: draft.status,
     controlState: draft.controlState,
+    launchRequested: draft.launchRequested,
     turnIndex: draft.turnIndex,
     left: draft.left,
     right: draft.right,

@@ -142,7 +142,7 @@ export function applyPlanControlPreviewToPlanRecord(args: {
         ...nextPlan,
         pending_modified_text: nextText,
         control_state: 'pause_requested',
-        launch_requested: true,
+        launch_requested: false,
       };
     }
     return applyConfirmedModificationPreview(nextPlan, nextText);

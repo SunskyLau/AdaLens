@@ -489,6 +489,7 @@ class AnalyzerAgent:
         session = self._load_or_create_session(store, checkpoint_path)
         base_messages = self._deserialize_messages(session.get("messages", []))
         trace: list[str] = list(session.get("trace", []))
+        replay_history = self._normalize_replay_history(session.get("replay_history", []))
         records = [
             ExecutionRecord.from_dict(item)
             for item in session.get("execution_records", []) or []
@@ -606,6 +607,7 @@ class AnalyzerAgent:
                     plan.plan_id,
                     base_messages,
                     trace,
+                    replay_history,
                     turn,
                     records=records,
                     protocol_state=self._build_protocol_state(
@@ -777,6 +779,7 @@ class AnalyzerAgent:
                     store=store,
                     code=prepared_code.original_code,
                     prepared_code=prepared_code,
+                    replay_history=replay_history,
                     control_callback=control_callback,
                     attempt=len(records) + 1,
                     log_event=emit_plan_log,
@@ -837,6 +840,10 @@ class AnalyzerAgent:
                     successful_execute_with_plot_count,
                     historical_plot_count,
                 )
+                if record.success:
+                    replay_snippet = prepared_code.sanitized_code.strip()
+                    if replay_snippet:
+                        replay_history.append(replay_snippet)
                 must_reflect_next = True
                 base_messages.append(
                     ToolMessage(
@@ -1088,6 +1095,7 @@ class AnalyzerAgent:
         store: Any,
         code: str,
         prepared_code: PreparedExecutionCode,
+        replay_history: list[str],
         control_callback: Callable[[], dict[str, Any]],
         attempt: int,
         log_event: Callable[..., None] | None = None,
@@ -1096,7 +1104,11 @@ class AnalyzerAgent:
         plots_dir.mkdir(parents=True, exist_ok=True)
         before_plots = {item.name for item in plots_dir.glob(f"{plan.plan_id}*.png")}
         code_path = store.save_code(plan.plan_id, code, attempt)
-        effective_code = self._build_effective_code(state, plan, prepared_code.sanitized_code, plots_dir)
+        runtime_code = self._build_runtime_user_code(
+            replay_history,
+            prepared_code.sanitized_code,
+        )
+        effective_code = self._build_effective_code(state, plan, runtime_code, plots_dir)
         effective_code_path = store.save_effective_code(plan.plan_id, effective_code, attempt)
 
         stdout_chunks: list[str] = []
@@ -1203,6 +1215,7 @@ class AnalyzerAgent:
             from matplotlib.figure import Figure
             import pandas as pd
             import os
+            import builtins
             import pathlib
             from pathlib import Path
 
@@ -1211,6 +1224,17 @@ class AnalyzerAgent:
             PLAN_ID = r'''__PLAN_ID__'''
             DATASET_DELIMITER = __DATASET_DELIMITER__
             Path(PLOTS_DIR).mkdir(parents=True, exist_ok=True)
+            os.environ['DATASET_PATH'] = DATASET_PATH
+            os.environ['PLOTS_DIR'] = PLOTS_DIR
+            os.environ['PLAN_ID'] = PLAN_ID
+
+            _REPLAY_MODE = False
+            _orig_print = builtins.print
+            def _patched_print(*args, **kwargs):
+                if _REPLAY_MODE:
+                    return None
+                return _orig_print(*args, **kwargs)
+            builtins.print = _patched_print
 
             def _coerce_path_string(_p):
                 try:
@@ -1325,6 +1349,8 @@ class AnalyzerAgent:
 
             _orig_plt_savefig = plt.savefig
             def _patched_plt_savefig(fname, *args, **kwargs):
+                if _REPLAY_MODE:
+                    return None
                 fig = plt.gcf()
                 if _fig_has_data(fig):
                     _enforce_single_chart(fig)
@@ -1334,6 +1360,8 @@ class AnalyzerAgent:
 
             _orig_fig_savefig = Figure.savefig
             def _patched_fig_savefig(self, fname, *args, **kwargs):
+                if _REPLAY_MODE:
+                    return None
                 if _fig_has_data(self):
                     _enforce_single_chart(self)
                 try:
@@ -1345,6 +1373,8 @@ class AnalyzerAgent:
 
             def _save_current_plot():
                 global _PLOT_COUNTER
+                if _REPLAY_MODE:
+                    return None
                 figs = plt.get_fignums()
                 if not figs:
                     return None
@@ -1359,6 +1389,8 @@ class AnalyzerAgent:
 
             def _save_all_open_figures():
                 global _PLOT_COUNTER
+                if _REPLAY_MODE:
+                    return None
                 for num in list(plt.get_fignums()):
                     if num in _SAVED_FIGNUMS:
                         continue
@@ -1371,8 +1403,22 @@ class AnalyzerAgent:
                     fig.savefig(path, dpi=150, bbox_inches='tight')
 
             def _auto_show(*args, **kwargs):
+                if _REPLAY_MODE:
+                    return None
                 return _save_current_plot()
             plt.show = _auto_show
+
+            def _run_replay_snippet(_source):
+                global _REPLAY_MODE
+                _REPLAY_MODE = True
+                try:
+                    exec(_source, globals(), globals())
+                finally:
+                    try:
+                        plt.close('all')
+                    except Exception:
+                        pass
+                    _REPLAY_MODE = False
 
             df = pd.read_csv(DATASET_PATH)
             """
@@ -1385,6 +1431,29 @@ class AnalyzerAgent:
             .replace("__DATASET_DELIMITER__", repr(delimiter))
         )
         return backend_setup + "\n\n" + code.strip() + "\n\n_save_all_open_figures()\n"
+
+    @staticmethod
+    def _normalize_replay_history(raw_history: Any) -> list[str]:
+        if not isinstance(raw_history, list):
+            return []
+        history: list[str] = []
+        for item in raw_history:
+            snippet = str(item or "").strip()
+            if snippet:
+                history.append(snippet)
+        return history
+
+    @staticmethod
+    def _build_runtime_user_code(replay_history: list[str], current_code: str) -> str:
+        steps = [
+            f"_run_replay_snippet({snippet!r})"
+            for snippet in replay_history
+            if isinstance(snippet, str) and snippet.strip()
+        ]
+        current = current_code.strip()
+        if current:
+            steps.append(current)
+        return "\n\n".join(step for step in steps if step).strip() + "\n"
 
     @staticmethod
     def _pending_control_action(control_callback: Callable[[], dict[str, Any]]) -> str | None:
@@ -1415,6 +1484,7 @@ class AnalyzerAgent:
         plan_id: str,
         messages: list[Any],
         trace: list[str],
+        replay_history: list[str],
         turn: int,
         records: list[ExecutionRecord],
         protocol_state: dict[str, Any],
@@ -1426,6 +1496,7 @@ class AnalyzerAgent:
             {
                 "messages": serializable_messages,
                 "trace": list(trace),
+                "replay_history": [str(item) for item in replay_history if str(item).strip()],
                 "turn": turn,
                 "execution_records": [record.to_dict() for record in records],
                 "protocol_state": dict(protocol_state),
