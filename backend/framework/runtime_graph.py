@@ -139,6 +139,71 @@ class RuntimeGraph:
             return "finalize_run"
         return "wait_for_steering_or_signal"
 
+    def _enqueue_internal_signal(self, signal: dict[str, Any]) -> None:
+        kind = str(signal.get("kind", "") or "").strip()
+        if not kind:
+            return
+        dispatch_turn_index = signal.get("dispatch_turn_index")
+        source_action = str(signal.get("source_action", "") or "").strip()
+        for existing in self._pending_internal_signals:
+            existing_kind = str(existing.get("kind", "") or "").strip()
+            existing_dispatch_turn_index = existing.get("dispatch_turn_index")
+            existing_source_action = str(existing.get("source_action", "") or "").strip()
+            if existing_kind != kind:
+                continue
+            if existing_dispatch_turn_index != dispatch_turn_index:
+                continue
+            if existing_source_action != source_action:
+                continue
+            return
+        self._pending_internal_signals.append(dict(signal))
+
+    def _has_nonterminal_plans(self) -> bool:
+        assert self.state is not None
+        return any(
+            plan.status in {"pending", "paused", "analyzing", "summarizing"}
+            for plan in self.state.plans
+        )
+
+    def _should_enqueue_post_stage_summary_review(self, batch: DispatchBatchState | None) -> bool:
+        assert self.state is not None
+        if batch is None:
+            return False
+        if self.state.master_agent_state.completed:
+            return False
+        if str(self.state.final_summary or "").strip():
+            return False
+        if self._has_nonterminal_plans():
+            return False
+        if not self.state.findings:
+            return False
+        return True
+
+    def _latest_user_goal_text(self) -> str:
+        assert self.state is not None
+        current_turn = self.state.current_turn()
+        if current_turn is not None and str(current_turn.goal or "").strip():
+            return str(current_turn.goal or "").strip()
+        if self.state.master_agent_state.current_goals:
+            return str(self.state.master_agent_state.current_goals[-1] or "").strip()
+        return ""
+
+    def _should_enqueue_post_emit_response_review(self) -> bool:
+        assert self.state is not None
+        if self.state.master_agent_state.completed:
+            return False
+        if str(self.state.final_summary or "").strip():
+            return False
+        if any(plan.status in {"pending", "paused", "analyzing", "summarizing"} for plan in self.state.plans):
+            return True
+        if any(batch.status == "waiting_for_stage_summary" for batch in self.state.batches):
+            return True
+        if not self.state.plans and self._latest_user_goal_text():
+            return True
+        if self.state.findings and not self._has_nonterminal_plans():
+            return True
+        return False
+
     async def run(
         self,
         *,
@@ -309,6 +374,17 @@ class RuntimeGraph:
                     f"message={self._truncate(message_text, 160)!r}"
                 )
             self._consume_steering_ids(action.consumed_steering_ids)
+            if message_text and self._should_enqueue_post_emit_response_review():
+                signal = {
+                    "kind": "post_emit_response_review_ready",
+                    "source_action": "emit_response",
+                    "reason": "response_emitted_but_follow_up_work_may_remain",
+                }
+                self._enqueue_internal_signal(signal)
+                self._log(
+                    f"[runtime run={self._run_tag()}] signal=post_emit_response_review_ready "
+                    f"reason={signal.get('reason')!r}"
+                )
             self.state.step += 1
             self.store.save_state(self.state)
             return self.state
@@ -423,6 +499,18 @@ class RuntimeGraph:
                 TimelineEntry(entry_type="emit_stage_synthesis", content=stage_payload)
             )
             self._consume_steering_ids(action.consumed_steering_ids)
+            if self._should_enqueue_post_stage_summary_review(batch):
+                signal = {
+                    "kind": "post_stage_summary_review_ready",
+                    "source_action": "emit_stage_synthesis",
+                    "dispatch_turn_index": batch.dispatch_turn_index if batch is not None else None,
+                    "reason": "stage_summary_emitted_and_all_current_work_is_terminal",
+                }
+                self._enqueue_internal_signal(signal)
+                self._log(
+                    f"[runtime run={self._run_tag()}] signal=post_stage_summary_review_ready "
+                    f"dispatch_turn_index={signal.get('dispatch_turn_index')}"
+                )
             self.state.step += 1
             self.store.save_state(self.state)
             self._log(

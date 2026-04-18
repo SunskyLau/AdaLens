@@ -68,6 +68,7 @@ Canonical examples:
 - `worker_finding_ready`
 - `worker_status_updated`
 - `dispatch_ready`
+- `post_stage_summary_review_ready`
 
 Signals wake `wait_for_steering_or_signal` and trigger the next orchestrator round against refreshed persisted state.
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from typing import Any, Callable
 
@@ -217,6 +218,10 @@ def _build_orchestrator_augmentation_prompt() -> str:
         "- When an elaborate steering is active, keep follow-up tightly scoped to that one insight. If multiple tightly coupled explanations or mechanism checks are still needed, 2-3 coordinated follow-up plans are allowed, but avoid unrelated branching.\n"
         "- Prefer plans that differ by analytical angle, mechanism, validation path, or evidence strategy. If multiple candidate plans overlap heavily, keep the more complementary decomposition.\n"
         "- Reuse rich derived context as a deliberation brief: read the narrative sections to understand uncovered follow-ups, already-covered angles, and where current plan coverage is still too flat.\n"
+        "- When the latest user-authored input is a direct question, a follow-up, or a progress/explanation request, and the current state already supports a grounded short explanation, consider `emit_response` instead of silent waiting.\n"
+        "- When a dispatch batch has just finished or a stage synthesis has just been emitted, a concise `emit_response` can be appropriate if it helps the user understand what just happened and what the likely next step is.\n"
+        "- Review-ready signals indicate that another deliberation round is worthwhile; they do not require continuation, and `wait` remains valid when no materially useful action is justified.\n"
+        "- Avoid repetitive acknowledgement loops. If a review-ready signal wakes a new round but there is no new substantive explanation or follow-up work to do, prefer `wait` over another redundant `emit_response`.\n"
     )
 
 
@@ -231,6 +236,72 @@ def _message_kind(message: UserMessage | None) -> str:
         return "chat"
     raw_kind = str(message.kind or "").strip().lower()
     return raw_kind or "chat"
+
+
+def _parse_iso_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _text_looks_like_direct_question(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    lowered = normalized.casefold()
+    if normalized.endswith("?") or normalized.endswith("？"):
+        return True
+    return any(
+        lowered.startswith(prefix)
+        for prefix in (
+            "what ",
+            "why ",
+            "how ",
+            "when ",
+            "where ",
+            "who ",
+            "which ",
+            "can ",
+            "could ",
+            "would ",
+            "should ",
+            "is ",
+            "are ",
+            "do ",
+            "does ",
+            "did ",
+        )
+    )
+
+
+def _text_requests_progress_or_explanation(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "progress",
+            "status",
+            "update",
+            "explain",
+            "explanation",
+            "why",
+            "what happened",
+            "what now",
+            "next step",
+            "next",
+            "summary",
+            "summarize",
+        )
+    )
 
 
 def _message_id_to_turn_index(run_state: RunState) -> dict[str, int]:
@@ -426,6 +497,180 @@ def _open_follow_up_signals(run_state: RunState) -> list[dict[str, Any]]:
             }
         )
     return open_items
+
+
+def _latest_timeline_timestamp(
+    run_state: RunState,
+    *,
+    entry_types: set[str],
+) -> datetime | None:
+    timestamps = [
+        _parse_iso_timestamp(getattr(entry, "timestamp", None))
+        for entry in getattr(run_state, "timeline", [])
+        if str(getattr(entry, "entry_type", "") or "").strip() in entry_types
+    ]
+    parsed_timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
+    if not parsed_timestamps:
+        return None
+    return max(parsed_timestamps)
+
+
+def _response_opportunity_hints(run_state: RunState) -> dict[str, Any]:
+    latest_message = _latest_user_message(run_state)
+    latest_message_text = (
+        str(
+            latest_message.user_prompt
+            or latest_message.generated_prompt
+            or latest_message.content
+            or ""
+        ).strip()
+        if latest_message is not None
+        else ""
+    )
+    latest_message_kind = _message_kind(latest_message)
+    latest_message_timestamp = (
+        _parse_iso_timestamp(getattr(latest_message, "timestamp", None))
+        if latest_message is not None
+        else None
+    )
+    latest_emit_response_timestamp = _latest_timeline_timestamp(
+        run_state,
+        entry_types={"emit_response"},
+    )
+    latest_user_message_unacknowledged = bool(
+        latest_message is not None and (
+            latest_emit_response_timestamp is None
+            or latest_message_timestamp is None
+            or latest_emit_response_timestamp < latest_message_timestamp
+        )
+    )
+    launch_priority_present = any(
+        bool(plan.launch_requested) and plan.status in {"pending", "paused"}
+        for plan in run_state.plans
+    )
+    waiting_for_stage_summary_present = any(
+        batch.status == "waiting_for_stage_summary"
+        for batch in run_state.batches
+    )
+    current_turn = run_state.current_turn()
+    no_plan_and_goal_needs_expansion = bool(
+        not run_state.plans
+        and str(current_turn.goal if current_turn is not None else "").strip()
+    )
+    grounded_response_possible_from_existing_findings = bool(
+        run_state.findings
+        or any(str(plan.final_summary or "").strip() for plan in run_state.plans)
+        or str(run_state.final_summary or "").strip()
+    )
+    latest_user_message_is_direct_question = _text_looks_like_direct_question(latest_message_text)
+    latest_user_message_requests_progress_or_explanation = _text_requests_progress_or_explanation(
+        latest_message_text
+    )
+    latest_user_message_is_new_goal_like = bool(
+        latest_message_kind == "chat"
+        and latest_message_text
+        and not latest_user_message_is_direct_question
+        and _looks_like_broad_goal(
+            latest_message_text,
+            active_elaborate_is_tight_scope=False,
+        )
+    )
+    recent_signals = list(getattr(run_state, "timeline", [])[-10:])
+    recent_batch_finished = any(
+        str(getattr(entry, "entry_type", "") or "") == "worker_finding_ready"
+        for entry in recent_signals
+    ) and any(
+        batch.status == "waiting_for_stage_summary" for batch in run_state.batches
+    )
+    recent_batch_finished_has_retained_findings = bool(recent_batch_finished and run_state.findings)
+    response_should_not_preempt_higher_priority_action = bool(
+        launch_priority_present
+        or waiting_for_stage_summary_present
+        or no_plan_and_goal_needs_expansion
+    )
+
+    advisory_notes: list[str] = []
+    if latest_user_message_unacknowledged and latest_user_message_is_direct_question:
+        advisory_notes.append(
+            "The latest user-authored message looks like a direct question. If the current state already supports a grounded answer, a short emit_response may be justified."
+        )
+    if latest_user_message_unacknowledged and latest_user_message_requests_progress_or_explanation:
+        advisory_notes.append(
+            "The latest user-authored message appears to request progress or explanation. A concise emit_response can be appropriate when it adds real clarity."
+        )
+    if latest_user_message_unacknowledged and latest_user_message_is_new_goal_like:
+        advisory_notes.append(
+            "The latest user-authored chat message looks like a new goal or broad follow-up. A brief acknowledgement is allowed, but it should not block necessary planning."
+        )
+    if recent_batch_finished_has_retained_findings:
+        advisory_notes.append(
+            "A dispatch batch appears to have just finished with retained findings. A short emit_response can help bridge from results to the next deliberate move."
+        )
+    if response_should_not_preempt_higher_priority_action:
+        advisory_notes.append(
+            "A higher-priority action may already be available. Do not force emit_response when dispatch, planning, or stage synthesis is clearly due."
+        )
+
+    return {
+        "latest_user_message_kind": latest_message_kind,
+        "latest_user_message_present": latest_message is not None,
+        "latest_user_message_is_direct_question": latest_user_message_is_direct_question,
+        "latest_user_message_requests_progress_or_explanation": latest_user_message_requests_progress_or_explanation,
+        "latest_user_message_is_new_goal_like": latest_user_message_is_new_goal_like,
+        "latest_user_message_unacknowledged": latest_user_message_unacknowledged,
+        "grounded_response_possible_from_existing_findings": grounded_response_possible_from_existing_findings,
+        "response_should_not_preempt_higher_priority_action": response_should_not_preempt_higher_priority_action,
+        "recent_batch_finished": recent_batch_finished,
+        "recent_batch_finished_has_retained_findings": recent_batch_finished_has_retained_findings,
+        "advisory_notes": advisory_notes,
+    }
+
+
+def _review_opportunity_hints(run_state: RunState) -> dict[str, Any]:
+    recent_signal_kinds = {
+        str(getattr(entry, "entry_type", "") or "").strip()
+        for entry in getattr(run_state, "timeline", [])[-20:]
+    }
+    nonterminal_plans_present = any(
+        plan.status in {"pending", "paused", "analyzing", "summarizing"}
+        for plan in run_state.plans
+    )
+    waiting_for_stage_summary_present = any(
+        batch.status == "waiting_for_stage_summary"
+        for batch in run_state.batches
+    )
+    all_current_work_terminal = bool(run_state.plans) and not nonterminal_plans_present
+    final_summary_missing = not str(run_state.final_summary or "").strip()
+    findings_available = bool(run_state.findings)
+
+    advisory_notes: list[str] = []
+    if "post_emit_response_review_ready" in recent_signal_kinds:
+        advisory_notes.append(
+            "A post-emit_response review signal is present. Another deliberation round may be useful, but continuation is optional."
+        )
+    if "post_stage_summary_review_ready" in recent_signal_kinds:
+        advisory_notes.append(
+            "A post-stage-summary review signal is present. Another deliberation round may be useful, but continuation is optional."
+        )
+    if all_current_work_terminal and findings_available and final_summary_missing:
+        advisory_notes.append(
+            "All current work is terminal and retained findings are available. Re-evaluating completion can be worthwhile."
+        )
+    if nonterminal_plans_present:
+        advisory_notes.append(
+            "Nonterminal work still exists. Review-ready signals should not be treated as mandatory closure instructions."
+        )
+
+    return {
+        "post_emit_response_review_ready_present": "post_emit_response_review_ready" in recent_signal_kinds,
+        "post_stage_summary_review_ready_present": "post_stage_summary_review_ready" in recent_signal_kinds,
+        "nonterminal_plans_present": nonterminal_plans_present,
+        "waiting_for_stage_summary_present": waiting_for_stage_summary_present,
+        "all_current_work_terminal": all_current_work_terminal,
+        "final_summary_missing": final_summary_missing,
+        "findings_available": findings_available,
+        "advisory_notes": advisory_notes,
+    }
 
 
 def _normalized_plan_text(text: str) -> str:
@@ -836,6 +1081,102 @@ def _render_open_follow_up_signals_text(open_follow_up_signals: list[dict[str, A
     return _render_context_section("OPEN FOLLOW-UP SIGNALS", lines)
 
 
+def _render_response_opportunity_hints_text(response_hints: dict[str, Any]) -> str:
+    lines = [
+        "These hints describe when a concise emit_response may be useful. They are advisory only and should not preempt clearly higher-priority work."
+    ]
+    lines.append(
+        "latest_user_message_kind: "
+        + str(response_hints.get("latest_user_message_kind", "chat"))
+    )
+    lines.append(
+        "latest_user_message_present: "
+        + str(bool(response_hints.get("latest_user_message_present")))
+    )
+    lines.append(
+        "latest_user_message_is_direct_question: "
+        + str(bool(response_hints.get("latest_user_message_is_direct_question")))
+    )
+    lines.append(
+        "latest_user_message_requests_progress_or_explanation: "
+        + str(bool(response_hints.get("latest_user_message_requests_progress_or_explanation")))
+    )
+    lines.append(
+        "latest_user_message_is_new_goal_like: "
+        + str(bool(response_hints.get("latest_user_message_is_new_goal_like")))
+    )
+    lines.append(
+        "latest_user_message_unacknowledged: "
+        + str(bool(response_hints.get("latest_user_message_unacknowledged")))
+    )
+    lines.append(
+        "grounded_response_possible_from_existing_findings: "
+        + str(bool(response_hints.get("grounded_response_possible_from_existing_findings")))
+    )
+    lines.append(
+        "response_should_not_preempt_higher_priority_action: "
+        + str(bool(response_hints.get("response_should_not_preempt_higher_priority_action")))
+    )
+    lines.append(
+        "recent_batch_finished: "
+        + str(bool(response_hints.get("recent_batch_finished")))
+    )
+    lines.append(
+        "recent_batch_finished_has_retained_findings: "
+        + str(bool(response_hints.get("recent_batch_finished_has_retained_findings")))
+    )
+    advisory_notes = response_hints.get("advisory_notes", [])
+    if isinstance(advisory_notes, list) and advisory_notes:
+        lines.append("advisory_notes:")
+        for note in advisory_notes:
+            normalized_note = str(note or "").strip()
+            if normalized_note:
+                lines.append(f"  - {normalized_note}")
+    return _render_context_section("RESPONSE OPPORTUNITY HINTS", lines)
+
+
+def _render_review_opportunity_hints_text(review_hints: dict[str, Any]) -> str:
+    lines = [
+        "Review-ready signals indicate another deliberation opportunity. They do not require continuation, and wait remains valid when no materially useful action is justified."
+    ]
+    lines.append(
+        "post_emit_response_review_ready_present: "
+        + str(bool(review_hints.get("post_emit_response_review_ready_present")))
+    )
+    lines.append(
+        "post_stage_summary_review_ready_present: "
+        + str(bool(review_hints.get("post_stage_summary_review_ready_present")))
+    )
+    lines.append(
+        "nonterminal_plans_present: "
+        + str(bool(review_hints.get("nonterminal_plans_present")))
+    )
+    lines.append(
+        "waiting_for_stage_summary_present: "
+        + str(bool(review_hints.get("waiting_for_stage_summary_present")))
+    )
+    lines.append(
+        "all_current_work_terminal: "
+        + str(bool(review_hints.get("all_current_work_terminal")))
+    )
+    lines.append(
+        "final_summary_missing: "
+        + str(bool(review_hints.get("final_summary_missing")))
+    )
+    lines.append(
+        "findings_available: "
+        + str(bool(review_hints.get("findings_available")))
+    )
+    advisory_notes = review_hints.get("advisory_notes", [])
+    if isinstance(advisory_notes, list) and advisory_notes:
+        lines.append("advisory_notes:")
+        for note in advisory_notes:
+            normalized_note = str(note or "").strip()
+            if normalized_note:
+                lines.append(f"  - {normalized_note}")
+    return _render_context_section("REVIEW OPPORTUNITY HINTS", lines)
+
+
 def _render_planning_coverage_hints_text(planning_coverage_hints: dict[str, Any]) -> str:
     lines = [
         "Interpret these hints as deliberation guidance only. They help explain where coverage is still too flat or repetitive."
@@ -913,6 +1254,8 @@ def _build_rich_derived_context_text(
     batch_inventory: list[dict[str, Any]],
     steering_history: list[dict[str, Any]],
     open_follow_up_signals: list[dict[str, Any]],
+    response_opportunity_hints: dict[str, Any],
+    review_opportunity_hints: dict[str, Any],
     planning_coverage_hints: dict[str, Any],
 ) -> str:
     sections = [
@@ -927,6 +1270,8 @@ def _build_rich_derived_context_text(
         _render_dispatch_batch_inventory_text(batch_inventory),
         _render_steering_history_text(steering_history),
         _render_open_follow_up_signals_text(open_follow_up_signals),
+        _render_response_opportunity_hints_text(response_opportunity_hints),
+        _render_review_opportunity_hints_text(review_opportunity_hints),
         _render_planning_coverage_hints_text(planning_coverage_hints),
     ]
     return "\n\n".join(section for section in sections if section.strip())
@@ -972,7 +1317,13 @@ def build_orchestrator_context(run_state: RunState) -> str:
     recent_signals = [
         entry.to_dict()
         for entry in run_state.timeline[-20:]
-        if entry.entry_type in {"worker_finding_ready", "worker_status_updated", "dispatch_ready"}
+        if entry.entry_type in {
+            "worker_finding_ready",
+            "worker_status_updated",
+            "dispatch_ready",
+            "post_emit_response_review_ready",
+            "post_stage_summary_review_ready",
+        }
     ]
     unsummarized_batches = [
         batch
@@ -998,6 +1349,8 @@ def build_orchestrator_context(run_state: RunState) -> str:
     batch_inventory = _dispatch_batch_inventory(run_state)
     steering_history = _steering_history(run_state)
     open_follow_up_signals = _open_follow_up_signals(run_state)
+    response_opportunity_hints = _response_opportunity_hints(run_state)
+    review_opportunity_hints = _review_opportunity_hints(run_state)
     planning_coverage_hints = _planning_coverage_hints(
         run_state,
         latest_user_goal=latest_user_goal,
@@ -1044,6 +1397,8 @@ def build_orchestrator_context(run_state: RunState) -> str:
             "DISPATCH BATCH INVENTORY": batch_inventory,
             "STEERING HISTORY": steering_history,
             "OPEN FOLLOW-UP SIGNALS": open_follow_up_signals,
+            "RESPONSE OPPORTUNITY HINTS": response_opportunity_hints,
+            "REVIEW OPPORTUNITY HINTS": review_opportunity_hints,
             "PLANNING COVERAGE HINTS": planning_coverage_hints,
         },
     }
@@ -1058,6 +1413,8 @@ def build_orchestrator_context(run_state: RunState) -> str:
         batch_inventory=batch_inventory,
         steering_history=steering_history,
         open_follow_up_signals=open_follow_up_signals,
+        response_opportunity_hints=response_opportunity_hints,
+        review_opportunity_hints=review_opportunity_hints,
         planning_coverage_hints=planning_coverage_hints,
     )
     return canonical_snapshot + "\n\n" + rich_derived_context

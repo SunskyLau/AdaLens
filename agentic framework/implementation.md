@@ -83,7 +83,7 @@ The three wake-up classes are:
 
 - `steering`: user-authored directional guidance such as chat follow-ups, `focus`, `ignore`, and `elaborate`
 - `execution control`: plan-thread controls such as `launch`, `pause`, `terminate`, `modify`, and `create`
-- `signal`: internal runtime events such as `worker_finding_ready`, `worker_status_updated`, `dispatch_ready`, and other wake-up conditions that justify another orchestrator round
+- `signal`: internal runtime events such as `worker_finding_ready`, `worker_status_updated`, `dispatch_ready`, `post_stage_summary_review_ready`, and other wake-up conditions that justify another orchestrator round
 
 ### 2.3 LangGraph and LangChain Responsibilities
 
@@ -510,6 +510,7 @@ Runtime-originated wake-up sources include:
 - `worker_finding_ready`: a worker has produced a persisted finding bundle
 - `worker_status_updated`: a worker has paused, resumed, failed, terminated, or checkpointed
 - `dispatch_ready`: newly created or newly unblocked plans are ready for a dispatch decision
+- `post_stage_summary_review_ready`: a stage synthesis has been emitted and the runtime should immediately re-run orchestration to decide whether the run should continue, wait, or finish
 
 ### 6.3 Orchestrator and Worker Output Contracts
 
