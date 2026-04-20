@@ -505,6 +505,9 @@ export interface RunCompletedEvent extends BaseEvent {
     total_summaries?: number;
     total_failures: number;
     final_status: string;
+    final_report?: string;
+    dispatch_turn_index?: number;
+    citations?: ProvenanceCitation[];
   };
 }
 

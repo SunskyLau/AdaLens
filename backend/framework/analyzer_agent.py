@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import json
 import os
 import re
@@ -597,48 +598,65 @@ class AnalyzerAgent:
                 prior_findings=prior_findings_text,
             )
 
+        def _checkpoint_and_return_control(
+            control_action: str,
+            *,
+            turn_number: int,
+            analysis_stream_joiner: str = "\n",
+        ) -> AnalyzerExecutionResult:
+            if worker_state is not None:
+                worker_state.analysis_phase = "terminated" if control_action == "terminate" else "paused"
+            checkpoint = self._save_checkpoint(
+                store,
+                plan.plan_id,
+                base_messages,
+                trace,
+                replay_history,
+                turn_number,
+                records=records,
+                protocol_state=self._build_protocol_state(
+                    initial_reflection_done=initial_reflection_done,
+                    must_reflect_next=must_reflect_next,
+                    did_execute_code=did_execute_code,
+                    successful_execute_count=successful_execute_count,
+                    successful_execute_with_evidence_count=successful_execute_with_evidence_count,
+                    successful_execute_with_plot_count=successful_execute_with_plot_count,
+                    log_seq=log_seq,
+                    current_stream_attempt=current_stream_attempt,
+                    started_attempts=sorted(started_attempts),
+                ),
+                worker_state=worker_state,
+            )
+            if worker_state is not None:
+                worker_state.checkpoint_ref = checkpoint
+            return AnalyzerExecutionResult(
+                analysis_stream=analysis_stream_joiner.join(trace),
+                execution_records=records,
+                control_action=control_action,
+                checkpoint_path=checkpoint,
+                resume_phase="analyzing",
+            )
+
         for turn in range(1, self.max_turns + 1):
             pending_control = self._pending_control_action(control_callback)
             if pending_control is not None:
-                if worker_state is not None:
-                    worker_state.analysis_phase = "paused"
-                checkpoint = self._save_checkpoint(
-                    store,
-                    plan.plan_id,
-                    base_messages,
-                    trace,
-                    replay_history,
-                    turn,
-                    records=records,
-                    protocol_state=self._build_protocol_state(
-                        initial_reflection_done=initial_reflection_done,
-                        must_reflect_next=must_reflect_next,
-                        did_execute_code=did_execute_code,
-                        successful_execute_count=successful_execute_count,
-                        successful_execute_with_evidence_count=successful_execute_with_evidence_count,
-                        successful_execute_with_plot_count=successful_execute_with_plot_count,
-                        log_seq=log_seq,
-                        current_stream_attempt=current_stream_attempt,
-                        started_attempts=sorted(started_attempts),
-                    ),
-                    worker_state=worker_state,
-                )
-                if worker_state is not None:
-                    worker_state.checkpoint_ref = checkpoint
-                return AnalyzerExecutionResult(
-                    analysis_stream="\n".join(trace),
-                    execution_records=records,
-                    control_action=pending_control,
-                    checkpoint_path=checkpoint,
-                    resume_phase="analyzing",
+                return _checkpoint_and_return_control(
+                    pending_control,
+                    turn_number=turn,
                 )
 
-            ai_message = self._invoke_model(
+            ai_message, interrupted_control = self._invoke_model_interruptibly(
                 base_messages,
+                control_callback=control_callback,
                 store=store,
                 plan_id=plan.plan_id,
                 turn=turn,
             )
+            if interrupted_control is not None:
+                return _checkpoint_and_return_control(
+                    interrupted_control,
+                    turn_number=turn,
+                )
             if ai_message is None:
                 return AnalyzerExecutionResult(
                     analysis_stream="\n".join(trace),
@@ -646,6 +664,12 @@ class AnalyzerAgent:
                     error="Analyzer model is unavailable.",
                 )
             base_messages.append(ai_message)
+            pending_control_after_model = self._pending_control_action(control_callback)
+            if pending_control_after_model is not None:
+                return _checkpoint_and_return_control(
+                    pending_control_after_model,
+                    turn_number=turn,
+                )
 
             tool_calls = list(getattr(ai_message, "tool_calls", []) or [])
             if not tool_calls:
@@ -669,6 +693,12 @@ class AnalyzerAgent:
             tool_name = str(tool_call.get("name", "") or "")
             tool_args = dict(tool_call.get("args", {}) or {})
             tool_call_id = str(tool_call.get("id", "") or f"tool_{turn}")
+            pending_control_before_tool = self._pending_control_action(control_callback)
+            if pending_control_before_tool is not None:
+                return _checkpoint_and_return_control(
+                    pending_control_before_tool,
+                    turn_number=turn,
+                )
 
             if must_reflect_next and tool_name != "reflect_on_results":
                 next_action = (
@@ -860,6 +890,13 @@ class AnalyzerAgent:
                         tool_call_id=tool_call_id,
                     )
                 )
+                pending_control_after_execute = self._pending_control_action(control_callback)
+                if pending_control_after_execute is not None:
+                    return _checkpoint_and_return_control(
+                        pending_control_after_execute,
+                        turn_number=turn,
+                        analysis_stream_joiner="\n\n",
+                    )
                 continue
 
             if tool_name == "complete_analysis":
@@ -999,24 +1036,27 @@ class AnalyzerAgent:
             error=f"Analyzer did not complete within max_turns={self.max_turns}",
         )
 
-    def _invoke_model(
+    def _call_model_once(self, messages: list[Any]) -> Any:
+        if self._llm_provider is not None:
+            return self._llm_provider(messages)
+        if self._model is None:
+            return None
+        return self._model.invoke(messages)
+
+    @staticmethod
+    def _coerce_ai_message(response: Any) -> AIMessage:
+        if isinstance(response, AIMessage):
+            return response
+        return AIMessage(content=str(getattr(response, "content", "") or ""))
+
+    def _persist_model_output(
         self,
-        messages: list[Any],
+        ai_message: AIMessage,
         *,
         store: Any | None = None,
         plan_id: str | None = None,
         turn: int | None = None,
-    ) -> AIMessage | None:
-        if self._llm_provider is not None:
-            response = self._llm_provider(messages)
-        elif self._model is None:
-            return None
-        else:
-            response = self._model.invoke(messages)
-        if isinstance(response, AIMessage):
-            ai_message = response
-        else:
-            ai_message = AIMessage(content=str(getattr(response, "content", "") or ""))
+    ) -> None:
         if store is not None and plan_id:
             store.save_llm_output(
                 "analyzer",
@@ -1036,7 +1076,64 @@ class AnalyzerAgent:
                     "turn": turn,
                 },
             )
+
+    def _invoke_model(
+        self,
+        messages: list[Any],
+        *,
+        store: Any | None = None,
+        plan_id: str | None = None,
+        turn: int | None = None,
+    ) -> AIMessage | None:
+        response = self._call_model_once(messages)
+        if response is None:
+            return None
+        ai_message = self._coerce_ai_message(response)
+        self._persist_model_output(
+            ai_message,
+            store=store,
+            plan_id=plan_id,
+            turn=turn,
+        )
         return ai_message
+
+    def _invoke_model_interruptibly(
+        self,
+        messages: list[Any],
+        *,
+        control_callback: Callable[[], dict[str, Any]],
+        store: Any | None = None,
+        plan_id: str | None = None,
+        turn: int | None = None,
+    ) -> tuple[AIMessage | None, str | None]:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self._call_model_once, list(messages))
+        try:
+            while True:
+                pending_control = self._pending_control_action(control_callback)
+                if pending_control is not None:
+                    future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return None, pending_control
+                try:
+                    response = future.result(timeout=0.05)
+                    break
+                except concurrent.futures.TimeoutError:
+                    continue
+            executor.shutdown(wait=False, cancel_futures=False)
+        except Exception:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        if response is None:
+            return None, None
+        ai_message = self._coerce_ai_message(response)
+        self._persist_model_output(
+            ai_message,
+            store=store,
+            plan_id=plan_id,
+            turn=turn,
+        )
+        return ai_message, None
 
     @staticmethod
     def _extract_provider_raw_payload(message: AIMessage) -> dict[str, Any] | None:
@@ -1161,6 +1258,22 @@ class AnalyzerAgent:
         plot_paths = [(plots_dir / name).relative_to(store.run_dir).as_posix() for name in new_plots]
         stdout_text = "".join(stdout_chunks) or str(result.get("stdout", "") or "")
         stderr_text = "".join(stderr_chunks) or str(result.get("stderr", "") or "")
+        interrupted_control_state = (
+            str(result.get("control_state", "") or "").strip()
+            if bool(result.get("stopped", False))
+            else ""
+        )
+        interruption_message = (
+            f"Execution interrupted due to {interrupted_control_state}."
+            if interrupted_control_state
+            else ""
+        )
+        if interruption_message:
+            if stderr_text.strip():
+                if interruption_message not in stderr_text:
+                    stderr_text = stderr_text.rstrip() + "\n" + interruption_message
+            else:
+                stderr_text = interruption_message
         if not stdout_chunks and stdout_text:
             emit_log("exec_stdout", stdout_text)
         if not stderr_chunks and stderr_text:
@@ -1180,7 +1293,10 @@ class AnalyzerAgent:
                 if not normalized_error or normalized_error.casefold() in {"none", "null", "undefined"}
                 else normalized_error
             )
-        if error_message:
+        if interruption_message:
+            emit_log("system", f"[SYSTEM NOTE]\n{interruption_message}\n")
+            error_message = None
+        elif error_message:
             emit_log("system", f"[EXECUTION ERROR]\n{error_message}\n")
         return ExecutionRecord(
             plan_id=plan.plan_id,

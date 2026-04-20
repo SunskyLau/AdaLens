@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import re
 from pathlib import Path
@@ -85,6 +86,12 @@ _CHINESE_SUMMARY_CONCISE_TAIL = (
 )
 _CHINESE_SUMMARY_UNAVAILABLE = "\u6682\u65e0\u53ef\u7528\u603b\u7ed3\u3002"
 _CHINESE_ANALYSIS_FAILED_PREFIX = "\u5206\u6790\u5931\u8d25\uff1a"
+
+
+class SummarizerControlInterrupt(RuntimeError):
+    def __init__(self, control_action: str) -> None:
+        super().__init__(control_action)
+        self.control_action = control_action
 
 
 def _build_summarizer_implementation_prompt() -> str:
@@ -301,7 +308,10 @@ class SummarizerAgent:
         execution_record: Any,
         store: Any | None = None,
         user_messages: list[Any] | None = None,
+        control_callback: Callable[[], dict[str, Any]] | None = None,
     ) -> WorkerFinding:
+        control_callback = control_callback or None
+        self._raise_if_control_requested(control_callback)
         context = self._build_runtime_context(
             plan=plan,
             execution_record=execution_record,
@@ -316,9 +326,13 @@ class SummarizerAgent:
             context=context,
         )
         if self._summary_provider is not None:
+            self._raise_if_control_requested(control_callback)
             finding = self._coerce_finding(self._summary_provider(summary_input), plan)
+            self._raise_if_control_requested(control_callback)
             finding = self._sanitize_finding(finding, plan, context)
+            self._raise_if_control_requested(control_callback)
             finding = self._normalize_finding(finding, plan, context=context)
+            self._raise_if_control_requested(control_callback)
             self._validate_grounded_finding(finding)
             return finding
         if self._structured_model is not None:
@@ -327,9 +341,12 @@ class SummarizerAgent:
                     summary_input=summary_input,
                     context=context,
                     latest_user_text=latest_user_authored_text(user_messages),
+                    control_callback=control_callback,
                 )
+                self._raise_if_control_requested(control_callback)
                 recovered_finding, recovery_source = self._recover_finding_from_result(result)
                 if recovered_finding is not None and recovery_source is not None:
+                    self._raise_if_control_requested(control_callback)
                     self._persist_raw_output(
                         store,
                         plan.plan_id,
@@ -337,7 +354,9 @@ class SummarizerAgent:
                         parsed_finding=recovered_finding,
                         recovery_source=recovery_source,
                     )
+                    self._raise_if_control_requested(control_callback)
                     finding = self._sanitize_finding(recovered_finding, plan, context)
+                    self._raise_if_control_requested(control_callback)
                     finding = self._normalize_finding(finding, plan, context=context)
                     language_retry = self._retry_for_language_alignment(
                         summary_input=summary_input,
@@ -345,9 +364,11 @@ class SummarizerAgent:
                         finding=finding,
                         plan=plan,
                         context=context,
+                        control_callback=control_callback,
                     )
                     if language_retry is not None:
                         retry_result, retry_finding, retry_recovery_source = language_retry
+                        self._raise_if_control_requested(control_callback)
                         self._persist_raw_output(
                             store,
                             plan.plan_id,
@@ -355,10 +376,14 @@ class SummarizerAgent:
                             parsed_finding=retry_finding,
                             recovery_source=retry_recovery_source,
                         )
+                        self._raise_if_control_requested(control_callback)
                         finding = self._sanitize_finding(retry_finding, plan, context)
+                        self._raise_if_control_requested(control_callback)
                         finding = self._normalize_finding(finding, plan, context=context)
+                    self._raise_if_control_requested(control_callback)
                     self._validate_grounded_finding(finding)
                     return finding
+                self._raise_if_control_requested(control_callback)
                 self._persist_raw_output(
                     store,
                     plan.plan_id,
@@ -375,11 +400,16 @@ class SummarizerAgent:
                         else None
                     ),
                 )
+            except SummarizerControlInterrupt:
+                raise
             except Exception as exc:
                 self._persist_invocation_error(store, plan.plan_id, exc)
                 pass
+        self._raise_if_control_requested(control_callback)
         finding = self._fallback(plan, analysis_stream, execution_record, context=context)
+        self._raise_if_control_requested(control_callback)
         finding = self._normalize_finding(finding, plan, context=context)
+        self._raise_if_control_requested(control_callback)
         self._validate_grounded_finding(finding)
         return finding
 
@@ -430,6 +460,7 @@ class SummarizerAgent:
         context: dict[str, Any],
         latest_user_text: str,
         retry_instruction: str | None = None,
+        control_callback: Callable[[], dict[str, Any]] | None = None,
     ) -> dict[str, Any] | Any:
         assert self._structured_model is not None
         messages = self._build_summary_messages(
@@ -438,7 +469,29 @@ class SummarizerAgent:
             latest_user_text=latest_user_text,
             retry_instruction=retry_instruction,
         )
-        return self._structured_model.invoke(messages)
+        if control_callback is None:
+            return self._structured_model.invoke(messages)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self._structured_model.invoke, messages)
+        try:
+            while True:
+                control_action = self._requested_control_action(control_callback)
+                if control_action is not None:
+                    future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise SummarizerControlInterrupt(control_action)
+                try:
+                    result = future.result(timeout=0.05)
+                    break
+                except concurrent.futures.TimeoutError:
+                    continue
+            executor.shutdown(wait=False, cancel_futures=False)
+            return result
+        except SummarizerControlInterrupt:
+            raise
+        except Exception:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
 
     def _build_summary_messages(
         self,
@@ -502,6 +555,7 @@ class SummarizerAgent:
         finding: WorkerFinding,
         plan: PlanItem,
         context: dict[str, Any],
+        control_callback: Callable[[], dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any] | Any, WorkerFinding, str] | None:
         if not self._response_violates_user_language(finding, latest_user_text=latest_user_text):
             return None
@@ -516,13 +570,39 @@ class SummarizerAgent:
                 context=context,
                 latest_user_text=latest_user_text,
                 retry_instruction=retry_instruction,
+                control_callback=control_callback,
             )
+        except SummarizerControlInterrupt:
+            raise
         except Exception:
             return None
         retry_finding, recovery_source = self._recover_finding_from_result(result)
         if retry_finding is None or recovery_source is None:
             return None
         return result, retry_finding, recovery_source
+
+    @staticmethod
+    def _requested_control_action(
+        control_callback: Callable[[], dict[str, Any]] | None,
+    ) -> str | None:
+        if control_callback is None:
+            return None
+        snapshot = control_callback() or {}
+        state = str(snapshot.get("control_state", "") or "")
+        if state == "pause_requested":
+            return "pause"
+        if state == "terminate_requested":
+            return "terminate"
+        return None
+
+    @classmethod
+    def _raise_if_control_requested(
+        cls,
+        control_callback: Callable[[], dict[str, Any]] | None,
+    ) -> None:
+        control_action = cls._requested_control_action(control_callback)
+        if control_action is not None:
+            raise SummarizerControlInterrupt(control_action)
 
     @staticmethod
     def _build_runtime_context(

@@ -50,9 +50,11 @@ import {
 } from './datasetsUpload';
 import { ensureRunProcessForSteer } from './resumeRun';
 import {
+  applyPendingPlanControlPreviews,
   applyPlanControlToPlanRecord,
   applyPlanControlPreviewToPlanRecord,
   buildPlanControlResponse,
+  shouldEnsureRunProcessForPlanControl,
   type PlanRecord,
 } from './planControl';
 import {
@@ -487,7 +489,21 @@ async function readRunState(runId: string): Promise<Record<string, unknown> | nu
   const statePath = path.join(RUNS_DIR, runId, 'state.json');
   try {
     const state = await readJsonFile(statePath);
-    return isRecord(state) ? normalizeStateForClient(state) : null;
+    if (!isRecord(state)) {
+      return null;
+    }
+    const normalizedState = normalizeStateForClient(state);
+    const planControlsPath = path.join(RUNS_DIR, runId, 'plan_controls.jsonl');
+    let controlPayloads: unknown[] = [];
+    try {
+      controlPayloads = await readJsonlFile(planControlsPath);
+    } catch {
+      controlPayloads = [];
+    }
+    return applyPendingPlanControlPreviews({
+      state: normalizedState,
+      controlPayloads,
+    });
   } catch {
     return null;
   }
@@ -1184,10 +1200,7 @@ app.post('/api/runs/:runId/plans/:planId/control', async (req, res) => {
       return;
     }
 
-    if (
-      (action === 'launch' || action === 'modify')
-      && (plan.status === 'paused' || plan.status === 'pending')
-    ) {
+    if (shouldEnsureRunProcessForPlanControl(plan, action)) {
       const existingProcess = runningProcesses.get(runId);
       const persistedProcessStatus = await getPersistedRunProcessStatus(RUNS_DIR, runId);
       if (

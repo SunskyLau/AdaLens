@@ -218,13 +218,15 @@ def _build_orchestrator_augmentation_prompt() -> str:
         "- When an elaborate steering is active, keep follow-up tightly scoped to that one insight. If multiple tightly coupled explanations or mechanism checks are still needed, 2-3 coordinated follow-up plans are allowed, but avoid unrelated branching.\n"
         "- Prefer plans that differ by analytical angle, mechanism, validation path, or evidence strategy. If multiple candidate plans overlap heavily, keep the more complementary decomposition.\n"
         "- Reuse rich derived context as a deliberation brief: read the narrative sections to understand uncovered follow-ups, already-covered angles, and where current plan coverage is still too flat.\n"
-        "- If a new user-authored input has not yet been acknowledged, one concise `emit_response` may be appropriate before other work, but that acknowledgement does not by itself complete scheduling or execution handoff.\n"
+        "- If a new user-authored input or steering has not yet been acknowledged, prioritize one concise `emit_response` as the first action before planning, dispatch, or progress evaluation unless explicit execution control, stop handling, or completion-oriented wrapping up clearly takes precedence.\n"
         "- When the latest user-authored input is a direct question, a follow-up, or a progress/explanation request, and the current state already supports a grounded short explanation, consider `emit_response` instead of silent waiting.\n"
         "- When a dispatch batch has just finished or a stage synthesis has just been emitted, a concise `emit_response` can be appropriate if it helps the user understand what just happened and what the likely next step is.\n"
-        "- If `dispatch_ready` is still present, or runnable pending/paused work remains with no active worker, treat scheduling as still outstanding even if a prior round already emitted a response.\n"
+        "- After that first acknowledgement, if `dispatch_ready` is still present or runnable pending/paused work remains with no active worker, treat scheduling as still outstanding in the next round.\n"
+        "- After that first acknowledgement, if `unprocessed_steering_ready` is present or active steering remains unlinked to any plan and has not been consumed, treat that steering follow-up as still unresolved in the next round.\n"
         "- Do not infer that work has already started merely because a batch exists or is marked dispatched; confirm worker activity from active plans / active workers before choosing to wait for execution.\n"
         "- Review-ready signals indicate that another deliberation round is worthwhile; they do not require continuation, and `wait` remains valid when no materially useful action is justified.\n"
         "- Avoid repetitive acknowledgement loops. If a review-ready signal wakes a new round but there is no new substantive explanation or follow-up work to do, prefer `wait` over another redundant `emit_response`.\n"
+        "- If multiple tool calls seem desirable in the same round, choose the single most important tool call first. The runtime can wake another round when continuation signals still remain.\n"
     )
 
 
@@ -519,6 +521,7 @@ def _latest_timeline_timestamp(
 
 
 def _response_opportunity_hints(run_state: RunState) -> dict[str, Any]:
+    unprocessed_steering_items = _open_follow_up_signals(run_state)
     latest_message = _latest_user_message(run_state)
     latest_message_text = (
         str(
@@ -589,20 +592,33 @@ def _response_opportunity_hints(run_state: RunState) -> dict[str, Any]:
         str(getattr(entry, "entry_type", "") or "") == "dispatch_ready"
         for entry in recent_signals
     )
+    unprocessed_steering_ready_present = any(
+        str(getattr(entry, "entry_type", "") or "") == "unprocessed_steering_ready"
+        for entry in recent_signals
+    )
     runnable_without_active_worker = bool(
         any(plan.status in {"pending", "paused"} for plan in run_state.plans)
         and not any(plan.status in {"analyzing", "summarizing"} for plan in run_state.plans)
     )
     recent_batch_finished_has_retained_findings = bool(recent_batch_finished and run_state.findings)
+    unprocessed_steering_present = bool(unprocessed_steering_items)
+    fresh_user_acknowledgement_preferred = bool(
+        latest_user_message_unacknowledged and latest_message is not None
+    )
     response_should_not_preempt_higher_priority_action = bool(
         launch_priority_present
         or waiting_for_stage_summary_present
-        or no_plan_and_goal_needs_expansion
-        or dispatch_ready_present
-        or runnable_without_active_worker
+        or (no_plan_and_goal_needs_expansion and not fresh_user_acknowledgement_preferred)
+        or (dispatch_ready_present and not fresh_user_acknowledgement_preferred)
+        or (unprocessed_steering_present and not fresh_user_acknowledgement_preferred)
+        or (runnable_without_active_worker and not fresh_user_acknowledgement_preferred)
     )
 
     advisory_notes: list[str] = []
+    if fresh_user_acknowledgement_preferred:
+        advisory_notes.append(
+            "A fresh user-authored input or steering is still unacknowledged. Prefer one concise emit_response as the first action now, then let later rounds handle planning, dispatch, or evaluation."
+        )
     if latest_user_message_unacknowledged and latest_user_message_is_direct_question:
         advisory_notes.append(
             "The latest user-authored message looks like a direct question. If the current state already supports a grounded answer, a short emit_response may be justified."
@@ -621,11 +637,15 @@ def _response_opportunity_hints(run_state: RunState) -> dict[str, Any]:
         )
     if dispatch_ready_present:
         advisory_notes.append(
-            "A dispatch_ready signal is still present. If you emit a response now, scheduling may still be the next materially useful step afterward."
+            "A dispatch_ready signal is still present. After the first acknowledgement, scheduling may still be the next materially useful step."
+        )
+    if unprocessed_steering_ready_present or unprocessed_steering_present:
+        advisory_notes.append(
+            "At least one steering follow-up is still unresolved. Use the first acknowledgement now if needed, but do not treat it as having completed the steering follow-up."
         )
     if runnable_without_active_worker:
         advisory_notes.append(
-            "Runnable pending or paused work remains but no worker is active. Do not treat prior acknowledgement as proof that execution handoff is complete."
+            "Runnable pending or paused work remains but no worker is active. After the first acknowledgement, execution handoff may still be the next action."
         )
     if response_should_not_preempt_higher_priority_action:
         advisory_notes.append(
@@ -640,8 +660,11 @@ def _response_opportunity_hints(run_state: RunState) -> dict[str, Any]:
         "latest_user_message_is_new_goal_like": latest_user_message_is_new_goal_like,
         "latest_user_message_unacknowledged": latest_user_message_unacknowledged,
         "grounded_response_possible_from_existing_findings": grounded_response_possible_from_existing_findings,
+        "fresh_user_acknowledgement_preferred": fresh_user_acknowledgement_preferred,
         "response_should_not_preempt_higher_priority_action": response_should_not_preempt_higher_priority_action,
         "dispatch_ready_present": dispatch_ready_present,
+        "unprocessed_steering_present": unprocessed_steering_present,
+        "unprocessed_steering_ready_present": unprocessed_steering_ready_present,
         "runnable_without_active_worker": runnable_without_active_worker,
         "recent_batch_finished": recent_batch_finished,
         "recent_batch_finished_has_retained_findings": recent_batch_finished_has_retained_findings,
@@ -654,6 +677,7 @@ def _review_opportunity_hints(run_state: RunState) -> dict[str, Any]:
         str(getattr(entry, "entry_type", "") or "").strip()
         for entry in getattr(run_state, "timeline", [])[-20:]
     }
+    unprocessed_steering_present = bool(_open_follow_up_signals(run_state))
     nonterminal_plans_present = any(
         plan.status in {"pending", "paused", "analyzing", "summarizing"}
         for plan in run_state.plans
@@ -675,6 +699,10 @@ def _review_opportunity_hints(run_state: RunState) -> dict[str, Any]:
         advisory_notes.append(
             "A post-stage-summary review signal is present. Another deliberation round may be useful, but continuation is optional."
         )
+    if "unprocessed_steering_ready" in recent_signal_kinds:
+        advisory_notes.append(
+            "An unprocessed_steering_ready signal is present. Another deliberation round may be useful because at least one steering follow-up is still unresolved."
+        )
     if all_current_work_terminal and findings_available and final_summary_missing:
         advisory_notes.append(
             "All current work is terminal and retained findings are available. Re-evaluating completion can be worthwhile."
@@ -683,10 +711,16 @@ def _review_opportunity_hints(run_state: RunState) -> dict[str, Any]:
         advisory_notes.append(
             "Nonterminal work still exists. Review-ready signals should not be treated as mandatory closure instructions."
         )
+    if unprocessed_steering_present:
+        advisory_notes.append(
+            "Active steering remains unprocessed. Review-ready signals should not be interpreted as proof that steering follow-up is already complete."
+        )
 
     return {
         "post_emit_response_review_ready_present": "post_emit_response_review_ready" in recent_signal_kinds,
         "post_stage_summary_review_ready_present": "post_stage_summary_review_ready" in recent_signal_kinds,
+        "unprocessed_steering_ready_present": "unprocessed_steering_ready" in recent_signal_kinds,
+        "unprocessed_steering_present": unprocessed_steering_present,
         "nonterminal_plans_present": nonterminal_plans_present,
         "waiting_for_stage_summary_present": waiting_for_stage_summary_present,
         "all_current_work_terminal": all_current_work_terminal,
@@ -1137,8 +1171,20 @@ def _render_response_opportunity_hints_text(response_hints: dict[str, Any]) -> s
         + str(bool(response_hints.get("grounded_response_possible_from_existing_findings")))
     )
     lines.append(
+        "fresh_user_acknowledgement_preferred: "
+        + str(bool(response_hints.get("fresh_user_acknowledgement_preferred")))
+    )
+    lines.append(
         "response_should_not_preempt_higher_priority_action: "
         + str(bool(response_hints.get("response_should_not_preempt_higher_priority_action")))
+    )
+    lines.append(
+        "unprocessed_steering_present: "
+        + str(bool(response_hints.get("unprocessed_steering_present")))
+    )
+    lines.append(
+        "unprocessed_steering_ready_present: "
+        + str(bool(response_hints.get("unprocessed_steering_ready_present")))
     )
     lines.append(
         "recent_batch_finished: "
@@ -1169,6 +1215,14 @@ def _render_review_opportunity_hints_text(review_hints: dict[str, Any]) -> str:
     lines.append(
         "post_stage_summary_review_ready_present: "
         + str(bool(review_hints.get("post_stage_summary_review_ready_present")))
+    )
+    lines.append(
+        "unprocessed_steering_ready_present: "
+        + str(bool(review_hints.get("unprocessed_steering_ready_present")))
+    )
+    lines.append(
+        "unprocessed_steering_present: "
+        + str(bool(review_hints.get("unprocessed_steering_present")))
     )
     lines.append(
         "nonterminal_plans_present: "
@@ -1344,6 +1398,7 @@ def build_orchestrator_context(run_state: RunState) -> str:
             "worker_finding_ready",
             "worker_status_updated",
             "dispatch_ready",
+            "unprocessed_steering_ready",
             "post_emit_response_review_ready",
             "post_stage_summary_review_ready",
         }
@@ -1479,6 +1534,8 @@ class _EmitStageSynthesisToolArgs(_OrchestratorToolArgsBase):
 
 class _EmitFinalReportToolArgs(_OrchestratorToolArgsBase):
     final_report: str
+    dispatch_turn_index: int | None = None
+    citations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 _ORCHESTRATOR_TOOL_ARG_MODELS: dict[str, type[_OrchestratorToolArgsBase]] = {
@@ -1625,6 +1682,11 @@ def _orchestrator_tool_specs() -> list[dict[str, Any]]:
                     "properties": {
                         **base_properties,
                         "final_report": {"type": "string"},
+                        "dispatch_turn_index": {"type": "integer"},
+                        "citations": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                        },
                     },
                     "required": ["final_report"],
                 },
@@ -1641,8 +1703,6 @@ def _parse_orchestrator_tool_message(
     tool_calls = list(getattr(message, "tool_calls", []) or [])
     if not tool_calls:
         return None, "structured_output_parsed_action_missing"
-    if len(tool_calls) > 1:
-        return None, "structured_output_multiple_tool_calls_not_supported"
 
     tool_call = tool_calls[0]
     tool_name = str(tool_call.get("name", "") or "").strip()
@@ -1685,6 +1745,10 @@ def _parse_orchestrator_tool_message(
     elif tool_name == "emit_final_report":
         validated_args = _EmitFinalReportToolArgs.model_validate(validated_args)
         payload = {"final_report": validated_args.final_report}
+        if validated_args.dispatch_turn_index is not None:
+            payload["dispatch_turn_index"] = validated_args.dispatch_turn_index
+        if validated_args.citations:
+            payload["citations"] = list(validated_args.citations)
     else:
         return None, f"structured_output_unknown_action_tool: {tool_name}"
 
@@ -1709,10 +1773,21 @@ class _ProviderCompatibleStructuredOutputModel:
     def invoke(self, messages: list[Any]) -> dict[str, Any]:
         raw_message = self._bound_model.invoke(messages)
         parsed, parsing_error = self._parser(raw_message)
+        tool_calls = list(getattr(raw_message, "tool_calls", []) or [])
+        ignored_extra_tool_calls = [
+            {
+                "id": str(tool_call.get("id", "") or ""),
+                "name": str(tool_call.get("name", "") or ""),
+                "args": dict(tool_call.get("args", {}) or {}),
+            }
+            for tool_call in tool_calls[1:]
+            if isinstance(tool_call, dict)
+        ]
         return {
             "raw": raw_message,
             "parsed": parsed,
             "parsing_error": parsing_error,
+            "ignored_extra_tool_calls": ignored_extra_tool_calls,
         }
 
 
@@ -1771,7 +1846,13 @@ class OrchestratorAgent:
                     state_snapshot=build_orchestrator_context(state),
                 )
                 raw_message = self._structured_model.invoke(base_messages)
-                action, parsed_output, parsing_error, validation_error = self._coerce_validated_action(raw_message)
+                (
+                    action,
+                    parsed_output,
+                    parsing_error,
+                    validation_error,
+                    ignored_extra_tool_calls,
+                ) = self._coerce_validated_action(raw_message)
                 self._persist_raw_output(
                     store,
                     state,
@@ -1779,6 +1860,7 @@ class OrchestratorAgent:
                     parsed_output=parsed_output,
                     parsing_error=parsing_error,
                     validation_error=validation_error,
+                    ignored_extra_tool_calls=ignored_extra_tool_calls,
                     final_outcome="accepted" if action is not None else "fallback",
                 )
                 if action is not None:
@@ -1790,10 +1872,16 @@ class OrchestratorAgent:
     @staticmethod
     def _coerce_validated_action(
         result: Any,
-    ) -> tuple[OrchestratorAction | None, dict[str, Any] | None, str | None, str | None]:
+    ) -> tuple[OrchestratorAction | None, dict[str, Any] | None, str | None, str | None, list[dict[str, Any]]]:
+        ignored_extra_tool_calls: list[dict[str, Any]] = []
         if isinstance(result, dict):
             parsed = result.get("parsed")
             parsing_error = result.get("parsing_error")
+            raw_ignored_extra_tool_calls = result.get("ignored_extra_tool_calls")
+            if isinstance(raw_ignored_extra_tool_calls, list):
+                ignored_extra_tool_calls = [
+                    item for item in raw_ignored_extra_tool_calls if isinstance(item, dict)
+                ]
             parsed_output = (
                 parsed.model_dump()
                 if isinstance(parsed, OrchestratorAction)
@@ -1801,19 +1889,29 @@ class OrchestratorAgent:
             )
         else:
             parsed, parsing_error = _parse_orchestrator_tool_message(result)
+            if isinstance(result, AIMessage):
+                ignored_extra_tool_calls = [
+                    {
+                        "id": str(tool_call.get("id", "") or ""),
+                        "name": str(tool_call.get("name", "") or ""),
+                        "args": dict(tool_call.get("args", {}) or {}),
+                    }
+                    for tool_call in list(getattr(result, "tool_calls", []) or [])[1:]
+                    if isinstance(tool_call, dict)
+                ]
             parsed_output = parsed.model_dump() if isinstance(parsed, OrchestratorAction) else None
         if parsing_error is not None:
-            return None, parsed_output, str(parsing_error).strip() or None, None
+            return None, parsed_output, str(parsing_error).strip() or None, None, ignored_extra_tool_calls
         if parsed is None:
-            return None, None, "structured_output_parsed_action_missing", None
+            return None, None, "structured_output_parsed_action_missing", None, ignored_extra_tool_calls
         try:
             action = parsed if isinstance(parsed, OrchestratorAction) else OrchestratorAction.model_validate(parsed)
         except Exception as exc:
-            return None, parsed_output, None, f"structured_output_action_coercion_failed: {str(exc).strip() or exc.__class__.__name__}"
+            return None, parsed_output, None, f"structured_output_action_coercion_failed: {str(exc).strip() or exc.__class__.__name__}", ignored_extra_tool_calls
         _, validation_error = validate_orchestrator_action_shape(action)
         if validation_error is not None:
-            return None, parsed_output, None, validation_error
-        return action, parsed_output, None, None
+            return None, parsed_output, None, validation_error, ignored_extra_tool_calls
+        return action, parsed_output, None, None, ignored_extra_tool_calls
 
     @staticmethod
     def _serialize_message(message: Any) -> dict[str, Any]:
@@ -1896,6 +1994,7 @@ class OrchestratorAgent:
         parsed_output: dict[str, Any] | None,
         parsing_error: str | None,
         validation_error: str | None = None,
+        ignored_extra_tool_calls: list[dict[str, Any]] | None = None,
         final_outcome: str | None = None,
     ) -> None:
         if store is None:
@@ -1911,6 +2010,8 @@ class OrchestratorAgent:
             "parsed_output": self._serialize_value(parsed_output),
             "parsing_error": parsing_error,
             "validation_error": validation_error,
+            "ignored_extra_tool_calls": list(ignored_extra_tool_calls or []),
+            "ignored_extra_tool_call_count": len(ignored_extra_tool_calls or []),
             "final_outcome": final_outcome,
         }
         label = f"loop{state.master_agent_state.loop_count + 1:04d}"

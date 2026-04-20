@@ -18,6 +18,26 @@ export type PlanRecord = Record<string, unknown> & {
   error_message?: string | null;
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+export type PlanControlRequestRecord = {
+  plan_id: string;
+  action: PlanControlAction;
+  timestamp: string;
+  user_authored_text?: string;
+};
+
+function isNonterminalPlanStatus(status: string): boolean {
+  return (
+    status === 'pending'
+    || status === 'paused'
+    || status === 'analyzing'
+    || status === 'summarizing'
+  );
+}
+
 export function applyPlanControlToPlanRecord(
   plan: PlanRecord,
   action: PlanControlAction
@@ -54,6 +74,142 @@ export function applyPlanControlToPlanRecord(
       || status === 'summarizing',
     changed: false,
   };
+}
+
+export function buildPlanControlRequestId(planId: string, timestamp: string): string {
+  return `control_${timestamp}_${planId}`;
+}
+
+function parsePlanControlRequestRecord(value: unknown): PlanControlRequestRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const planId = String(value.plan_id ?? '').trim();
+  const action = value.action;
+  const timestamp = String(value.timestamp ?? '').trim();
+  if (!planId || !timestamp) {
+    return null;
+  }
+  if (action !== 'launch' && action !== 'pause' && action !== 'modify' && action !== 'terminate') {
+    return null;
+  }
+  const nextValue: PlanControlRequestRecord = {
+    plan_id: planId,
+    action,
+    timestamp,
+  };
+  if (typeof value.user_authored_text === 'string') {
+    nextValue.user_authored_text = value.user_authored_text;
+  }
+  return nextValue;
+}
+
+export function shouldEnsureRunProcessForPlanControl(
+  plan: PlanRecord,
+  action: PlanControlAction
+): boolean {
+  const status = typeof plan.status === 'string' ? plan.status : 'pending';
+  if (!isNonterminalPlanStatus(status)) {
+    return false;
+  }
+  return action === 'launch' || action === 'pause' || action === 'terminate' || action === 'modify';
+}
+
+export function applyPendingPlanControlPreviews(args: {
+  state: Record<string, unknown>;
+  controlPayloads: unknown[];
+}): Record<string, unknown> {
+  const { state, controlPayloads } = args;
+  const nextState: Record<string, unknown> = { ...state };
+  const frontier = Array.isArray(nextState.frontier) ? nextState.frontier : null;
+  const plans = frontier ?? (Array.isArray(nextState.plans) ? nextState.plans : null);
+  if (!plans) {
+    return nextState;
+  }
+
+  const appliedControlIds = new Set<string>();
+  const executionControlState = isRecord(nextState.execution_control_state)
+    ? nextState.execution_control_state
+    : null;
+  if (Array.isArray(executionControlState?.applied_control_ids)) {
+    for (const rawControlId of executionControlState.applied_control_ids) {
+      const controlId = String(rawControlId ?? '').trim();
+      if (controlId) {
+        appliedControlIds.add(controlId);
+      }
+    }
+  }
+
+  const nextPlans = plans.map((rawPlan) => {
+    const normalizedPlan = applyPlanControlPreviewToPlanRecord({
+      plan: rawPlan as PlanRecord,
+      action: 'launch',
+    });
+    normalizedPlan.status = typeof (rawPlan as PlanRecord).status === 'string'
+      ? String((rawPlan as PlanRecord).status)
+      : 'pending';
+    normalizedPlan.control_state = typeof (rawPlan as PlanRecord).control_state === 'string'
+      ? String((rawPlan as PlanRecord).control_state)
+      : 'none';
+    normalizedPlan.launch_requested = Boolean((rawPlan as PlanRecord).launch_requested);
+    normalizedPlan.pending_modified_text =
+      typeof (rawPlan as PlanRecord).pending_modified_text === 'string'
+        ? String((rawPlan as PlanRecord).pending_modified_text)
+        : null;
+    return normalizedPlan;
+  });
+
+  const planIndexById = new Map<string, number>();
+  nextPlans.forEach((plan, index) => {
+    const planId = String(plan.plan_id ?? '').trim();
+    if (planId) {
+      planIndexById.set(planId, index);
+    }
+    for (const rawControlId of Array.isArray(plan.linked_control_ids) ? plan.linked_control_ids : []) {
+      const controlId = String(rawControlId ?? '').trim();
+      if (controlId) {
+        appliedControlIds.add(controlId);
+      }
+    }
+  });
+
+  for (const rawPayload of controlPayloads) {
+    const request = parsePlanControlRequestRecord(rawPayload);
+    if (!request) {
+      continue;
+    }
+    const controlId = buildPlanControlRequestId(request.plan_id, request.timestamp);
+    if (appliedControlIds.has(controlId)) {
+      continue;
+    }
+    const planIndex = planIndexById.get(request.plan_id);
+    if (typeof planIndex !== 'number') {
+      continue;
+    }
+    const existingPlan = nextPlans[planIndex];
+    const nextPlan = applyPlanControlPreviewToPlanRecord({
+      plan: existingPlan,
+      action: request.action,
+      userAuthoredText: request.user_authored_text,
+    });
+    const linkedControlIds = Array.isArray(existingPlan.linked_control_ids)
+      ? existingPlan.linked_control_ids.map((item) => String(item))
+      : [];
+    if (!linkedControlIds.includes(controlId)) {
+      linkedControlIds.push(controlId);
+    }
+    nextPlan.linked_control_ids = linkedControlIds;
+    nextPlans[planIndex] = nextPlan;
+    appliedControlIds.add(controlId);
+  }
+
+  if (frontier) {
+    nextState.frontier = nextPlans;
+  }
+  if (Array.isArray(nextState.plans)) {
+    nextState.plans = nextPlans;
+  }
+  return nextState;
 }
 
 function normalizePlanText(text: unknown): string {

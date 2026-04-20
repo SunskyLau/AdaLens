@@ -22,7 +22,7 @@ from .models import (
     WorkerSessionState,
     normalize_keyword_list,
 )
-from .summarizer_agent import SummarizerAgent
+from .summarizer_agent import SummarizerAgent, SummarizerControlInterrupt
 
 
 @dataclass
@@ -49,13 +49,6 @@ class WorkerRuntime:
         self._active_tasks: dict[str, asyncio.Task[Any]] = {}
         self._finished_signals: list[WorkerSignal] = []
         self._finished_results: list[tuple[str, Any]] = []
-
-    @staticmethod
-    def _drain_detached_task(task: asyncio.Task[Any]) -> None:
-        try:
-            task.result()
-        except Exception:
-            pass
 
     def _log(self, message: str) -> None:
         if self.progress_callback is not None:
@@ -125,24 +118,19 @@ class WorkerRuntime:
         run_state: RunState,
         control_callback: Callable[[], dict[str, Any]],
     ) -> tuple[WorkerFinding | None, str | None]:
-        summarizer_task = asyncio.create_task(
-            asyncio.to_thread(
+        try:
+            finding = await asyncio.to_thread(
                 self.summarizer.summarize,
                 plan=plan,
                 analysis_stream=analysis_stream,
                 execution_record=execution_record,
                 store=self.store,
                 user_messages=run_state.user_messages,
-            ),
-            name=f"summarize:{plan.plan_id}",
-        )
-        while not summarizer_task.done():
-            control_action = self._poll_control_action(control_callback)
-            if control_action in {"pause", "terminate"}:
-                summarizer_task.add_done_callback(self._drain_detached_task)
-                return None, control_action
-            await asyncio.sleep(0.05)
-        return await summarizer_task, None
+                control_callback=control_callback,
+            )
+        except SummarizerControlInterrupt as exc:
+            return None, str(exc.control_action or "").strip() or None
+        return finding, None
 
     async def run_worker_async(
         self,
@@ -187,14 +175,22 @@ class WorkerRuntime:
             checkpoint_path=plan.checkpoint_path,
         )
 
-        worker_context.analysis_phase = "summarizing"
-        latest_state = self.store.load_state()
-        if latest_state is not None:
-            latest_plan = latest_state.get_plan_by_id(plan.plan_id)
-            if latest_plan is not None and latest_plan.status in {"analyzing", "pending", "paused"}:
-                latest_plan.status = "summarizing"
-                self.store.log_plan_status_changed(latest_plan)
-                self.store.save_state(latest_state)
+        if analysis_result.control_action in {"pause", "terminate"}:
+            self._log(
+                f"[worker plan={plan.plan_id}] signal=worker_status_updated "
+                f"action={analysis_result.control_action} checkpoint={analysis_result.checkpoint_path or '<none>'}"
+            )
+            return {
+                "signals": [
+                    WorkerSignal(
+                        kind="worker_status_updated",
+                        plan_id=plan.plan_id,
+                        checkpoint_ref=analysis_result.checkpoint_path,
+                    )
+                ],
+                "result": analysis_result,
+            }
+
         self._log(
             f"[worker plan={plan.plan_id}] analysis_complete "
             f"records={len(analysis_result.execution_records)} error={bool(analysis_result.error)}"
@@ -217,22 +213,6 @@ class WorkerRuntime:
                     if path
                 ]
             )
-
-        if analysis_result.control_action in {"pause", "terminate"}:
-            self._log(
-                f"[worker plan={plan.plan_id}] signal=worker_status_updated "
-                f"action={analysis_result.control_action} checkpoint={analysis_result.checkpoint_path or '<none>'}"
-            )
-            return {
-                "signals": [
-                    WorkerSignal(
-                        kind="worker_status_updated",
-                        plan_id=plan.plan_id,
-                        checkpoint_ref=analysis_result.checkpoint_path,
-                    )
-                ],
-                "result": analysis_result,
-            }
 
         between_phase_control = self._poll_control_action(control_callback)
         if between_phase_control in {"pause", "terminate"}:
@@ -280,6 +260,15 @@ class WorkerRuntime:
                 "signals": [WorkerSignal(kind="worker_status_updated", plan_id=plan.plan_id)],
                 "result": analysis_result,
             }
+
+        worker_context.analysis_phase = "summarizing"
+        latest_state = self.store.load_state()
+        if latest_state is not None:
+            latest_plan = latest_state.get_plan_by_id(plan.plan_id)
+            if latest_plan is not None and latest_plan.status in {"analyzing", "pending", "paused"}:
+                latest_plan.status = "summarizing"
+                self.store.log_plan_status_changed(latest_plan)
+                self.store.save_state(latest_state)
 
         self._log(f"[worker plan={plan.plan_id}] phase=summarizing start")
         finding, summarizer_control = await self._run_summarizer_with_control(

@@ -129,6 +129,8 @@ class DispatchPlansPayloadModel(BaseModel):
 
 class EvaluateProgressPayloadModel(BaseModel):
     progress_digest: str
+    dispatch_turn_index: int | None = None
+    plan_ids: list[str] = Field(default_factory=list)
 
 
 class EmitResponsePayloadModel(BaseModel):
@@ -137,10 +139,14 @@ class EmitResponsePayloadModel(BaseModel):
 
 class EmitStageSynthesisPayloadModel(BaseModel):
     stage_synthesis: str
+    dispatch_turn_index: int | None = None
+    citations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class EmitFinalReportPayloadModel(BaseModel):
     final_report: str
+    dispatch_turn_index: int | None = None
+    citations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 ValidatedOrchestratorPayload = (
@@ -1284,6 +1290,21 @@ class ProvenanceCitation:
     target: SteeringTargetSnapshot
     label: str = ""
 
+    @staticmethod
+    def _default_label(target: SteeringTargetSnapshot) -> str:
+        if target.kind == "atomic":
+            return (
+                str(target.atomic_text or "").strip()
+                or str(target.atomic_id or "").strip()
+                or str(target.summary_short_label or "").strip()
+                or str(target.summary_id or "").strip()
+            )
+        return (
+            str(target.summary_short_label or "").strip()
+            or str(target.summary_text or "").strip()
+            or str(target.summary_id or "").strip()
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "marker": self.marker,
@@ -1308,7 +1329,7 @@ class ProvenanceCitation:
         return cls(
             marker=marker,
             target=target,
-            label=str(data.get("label", "")),
+            label=str(data.get("label", "") or "").strip() or cls._default_label(target),
         )
 
 

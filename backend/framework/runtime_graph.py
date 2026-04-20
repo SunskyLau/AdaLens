@@ -29,6 +29,7 @@ from .models import (
     ExecutionControlRequest,
     OrchestratorAction,
     PlanItem,
+    ProvenanceCitation,
     RunSettings,
     RunState,
     SteeringRequest,
@@ -42,6 +43,19 @@ from .models import (
 from .orchestrator_agent import OrchestratorAgent
 from .persistence import RunStore
 from .worker_runtime import WorkerRuntime
+
+
+@dataclass
+class RuntimeInputApplicationSummary:
+    has_inputs: bool = False
+    should_wake_orchestrator: bool = False
+
+    def merge(self, other: "RuntimeInputApplicationSummary") -> "RuntimeInputApplicationSummary":
+        self.has_inputs = self.has_inputs or other.has_inputs
+        self.should_wake_orchestrator = (
+            self.should_wake_orchestrator or other.should_wake_orchestrator
+        )
+        return self
 
 
 @dataclass
@@ -139,24 +153,59 @@ class RuntimeGraph:
             return "finalize_run"
         return "wait_for_steering_or_signal"
 
-    def _enqueue_internal_signal(self, signal: dict[str, Any]) -> None:
+    def _execution_control_requires_orchestrator(
+        self,
+        control: ExecutionControlRequest,
+    ) -> bool:
+        assert self.state is not None
+        if control.action in {"launch", "create"}:
+            return True
+        if control.action in {"pause", "terminate"}:
+            return False
+        if control.action != "modify":
+            return False
+        if not control.target_plan_id:
+            return False
+        plan = self.state.get_plan_by_id(control.target_plan_id)
+        if plan is None:
+            return False
+        return plan.status in {"pending", "paused"}
+
+    def _enqueue_internal_signal(self, signal: dict[str, Any]) -> bool:
         kind = str(signal.get("kind", "") or "").strip()
         if not kind:
-            return
+            return False
         dispatch_turn_index = signal.get("dispatch_turn_index")
         source_action = str(signal.get("source_action", "") or "").strip()
+        plan_ids = [str(plan_id) for plan_id in signal.get("plan_ids", []) or [] if str(plan_id)]
+        steering_ids = [
+            str(steering_id)
+            for steering_id in signal.get("steering_ids", []) or []
+            if str(steering_id)
+        ]
         for existing in self._pending_internal_signals:
             existing_kind = str(existing.get("kind", "") or "").strip()
             existing_dispatch_turn_index = existing.get("dispatch_turn_index")
             existing_source_action = str(existing.get("source_action", "") or "").strip()
+            existing_plan_ids = [str(plan_id) for plan_id in existing.get("plan_ids", []) or [] if str(plan_id)]
+            existing_steering_ids = [
+                str(steering_id)
+                for steering_id in existing.get("steering_ids", []) or []
+                if str(steering_id)
+            ]
             if existing_kind != kind:
                 continue
             if existing_dispatch_turn_index != dispatch_turn_index:
                 continue
             if existing_source_action != source_action:
                 continue
-            return
+            if existing_plan_ids != plan_ids:
+                continue
+            if existing_steering_ids != steering_ids:
+                continue
+            return False
         self._pending_internal_signals.append(dict(signal))
+        return True
 
     def _materialize_pending_internal_signals(self) -> list[str]:
         assert self.state is not None
@@ -196,6 +245,127 @@ class RuntimeGraph:
             return False
         return True
 
+    def _parse_provenance_citations(self, raw_items: Any) -> list[ProvenanceCitation]:
+        citations: list[ProvenanceCitation] = []
+        if not isinstance(raw_items, list):
+            return citations
+        seen_markers: set[int] = set()
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            citation = ProvenanceCitation.from_dict(item)
+            if citation is None or citation.marker in seen_markers:
+                continue
+            citations.append(citation)
+            seen_markers.add(citation.marker)
+        citations.sort(key=lambda item: item.marker)
+        return citations
+
+    @staticmethod
+    def _serialize_provenance_citations(citations: list[ProvenanceCitation]) -> list[dict[str, Any]]:
+        return [citation.to_dict() for citation in citations]
+
+    def _active_unprocessed_steering_ids(self) -> list[str]:
+        assert self.state is not None
+        steering_kind_by_id: dict[str, str] = {}
+        for message in self.state.user_messages:
+            steering_id = f"steer_{message.message_id}"
+            kind = str(message.kind or "").strip()
+            if kind in {"focus", "ignore", "elaborate"}:
+                steering_kind_by_id[steering_id] = kind
+
+        linked_steering_ids = {
+            str(steering_id)
+            for plan in self.state.plans
+            for steering_id in plan.linked_steering_ids
+            if str(steering_id)
+        }
+        unprocessed_ids: list[str] = []
+        for steering_id in self.state.steering_state.active_steering_ids:
+            normalized_steering_id = str(steering_id or "").strip()
+            if not normalized_steering_id:
+                continue
+            if normalized_steering_id not in steering_kind_by_id:
+                continue
+            if normalized_steering_id in self.state.steering_state.consumed_steering_ids:
+                continue
+            if normalized_steering_id in linked_steering_ids:
+                continue
+            unprocessed_ids.append(normalized_steering_id)
+        return unprocessed_ids
+
+    def _unprocessed_steering_signal(
+        self,
+        *,
+        source_action: str | None = None,
+    ) -> dict[str, Any] | None:
+        steering_ids = self._active_unprocessed_steering_ids()
+        if not steering_ids:
+            return None
+        signal: dict[str, Any] = {
+            "kind": "unprocessed_steering_ready",
+            "steering_ids": steering_ids,
+            "reason": "active_steering_remains_unprocessed",
+        }
+        if source_action:
+            signal["source_action"] = source_action
+        return signal
+
+    def _enqueue_continuation_signals(
+        self,
+        *,
+        source_action: str,
+        target_batch: DispatchBatchState | None = None,
+    ) -> None:
+        if source_action == "emit_response" and self._should_enqueue_post_emit_response_review():
+            signal = {
+                "kind": "post_emit_response_review_ready",
+                "source_action": "emit_response",
+                "reason": "response_emitted_but_follow_up_work_may_remain",
+            }
+            if self._enqueue_internal_signal(signal):
+                self._log(
+                    f"[runtime run={self._run_tag()}] signal=post_emit_response_review_ready "
+                    f"reason={signal.get('reason')!r}"
+                )
+
+        if (
+            source_action == "emit_stage_synthesis"
+            and self._should_enqueue_post_stage_summary_review(target_batch)
+        ):
+            signal = {
+                "kind": "post_stage_summary_review_ready",
+                "source_action": "emit_stage_synthesis",
+                "dispatch_turn_index": (
+                    target_batch.dispatch_turn_index if target_batch is not None else None
+                ),
+                "reason": "stage_summary_emitted_and_all_current_work_is_terminal",
+            }
+            if self._enqueue_internal_signal(signal):
+                self._log(
+                    f"[runtime run={self._run_tag()}] signal=post_stage_summary_review_ready "
+                    f"dispatch_turn_index={signal.get('dispatch_turn_index')}"
+                )
+
+        if not self.worker_runtime.active_plan_ids():
+            dispatch_ready_signal = self._dispatch_ready_signal_for_runnable_plans(
+                source_action=source_action,
+            )
+            if dispatch_ready_signal is not None and self._enqueue_internal_signal(dispatch_ready_signal):
+                self._log(
+                    f"[runtime run={self._run_tag()}] signal=dispatch_ready "
+                    f"plan_ids={dispatch_ready_signal.get('plan_ids', [])} "
+                    f"source_action={source_action!r}"
+                )
+
+        steering_signal = self._unprocessed_steering_signal(source_action=source_action)
+        if steering_signal is not None and self._enqueue_internal_signal(steering_signal):
+            self._log(
+                f"[runtime run={self._run_tag()}] signal=unprocessed_steering_ready "
+                f"steering_ids={steering_signal.get('steering_ids', [])} "
+                f"source_action={source_action!r}"
+            )
+
     def _latest_user_goal_text(self) -> str:
         assert self.state is not None
         current_turn = self.state.current_turn()
@@ -211,6 +381,8 @@ class RuntimeGraph:
             return False
         if str(self.state.final_summary or "").strip():
             return False
+        if self._active_unprocessed_steering_ids():
+            return True
         if any(plan.status in {"pending", "paused", "analyzing", "summarizing"} for plan in self.state.plans):
             return True
         if any(batch.status == "waiting_for_stage_summary" for batch in self.state.batches):
@@ -284,8 +456,9 @@ class RuntimeGraph:
             if refreshed is not None:
                 self.state = refreshed
                 self._sync_runtime_settings_from_state()
+            pending_input_summary = RuntimeInputApplicationSummary()
             if self._pending_runtime_inputs:
-                self._apply_pending_runtime_inputs()
+                pending_input_summary = self._apply_pending_runtime_inputs()
             if self._initial_wake_pending:
                 self._initial_wake_pending = False
                 self._log(
@@ -294,10 +467,16 @@ class RuntimeGraph:
                 return self.state
 
             wake_reasons: list[str] = []
-            if await self._ingest_runtime_inputs():
+            ingested_inputs = await self._ingest_runtime_inputs()
+            if ingested_inputs:
                 wake_reasons.append("input")
             if self._pending_runtime_inputs:
-                self._apply_pending_runtime_inputs()
+                pending_input_summary.merge(self._apply_pending_runtime_inputs())
+            if pending_input_summary.should_wake_orchestrator:
+                if "input" not in wake_reasons:
+                    wake_reasons.append("input")
+            elif wake_reasons == ["input"]:
+                wake_reasons.clear()
             if await self._ingest_finished_workers():
                 wake_reasons.append("worker_update")
             signal_kinds = self._materialize_pending_internal_signals()
@@ -367,7 +546,7 @@ class RuntimeGraph:
                 action.payload.get("response", action.payload.get("message", "")) or ""
             ).strip()
             if message_text:
-                response_payload = {"message": message_text}
+                response_payload: dict[str, Any] = {"message": message_text}
                 self.store.append_event("user_response", response_payload)
                 self.store.log_master_agent_tool_result(
                     "emit_response",
@@ -377,31 +556,12 @@ class RuntimeGraph:
                     TimelineEntry(entry_type="emit_response", content=response_payload)
                 )
                 self._log(
-                    f"[runtime run={self._run_tag()}] execute action=emit_response "
-                    f"message={self._truncate(message_text, 160)!r}"
-                )
-            self._consume_steering_ids(action.consumed_steering_ids)
-            if message_text and self._should_enqueue_post_emit_response_review():
-                signal = {
-                    "kind": "post_emit_response_review_ready",
-                    "source_action": "emit_response",
-                    "reason": "response_emitted_but_follow_up_work_may_remain",
-                }
-                self._enqueue_internal_signal(signal)
-                self._log(
-                    f"[runtime run={self._run_tag()}] signal=post_emit_response_review_ready "
-                    f"reason={signal.get('reason')!r}"
-                )
-            if message_text and not self.worker_runtime.active_plan_ids():
-                dispatch_ready_signal = self._dispatch_ready_signal_for_runnable_plans(
-                    source_action="emit_response",
-                )
-                if dispatch_ready_signal is not None:
-                    self._enqueue_internal_signal(dispatch_ready_signal)
-                    self._log(
-                        f"[runtime run={self._run_tag()}] signal=dispatch_ready "
-                        f"plan_ids={dispatch_ready_signal.get('plan_ids', [])} source_action='emit_response'"
+                        f"[runtime run={self._run_tag()}] execute action=emit_response "
+                        f"message={self._truncate(message_text, 160)!r}"
                     )
+            self._consume_steering_ids(action.consumed_steering_ids)
+            if message_text:
+                self._enqueue_continuation_signals(source_action="emit_response")
             self.state.step += 1
             self.store.save_state(self.state)
             return self.state
@@ -423,6 +583,8 @@ class RuntimeGraph:
             )
             self._consume_steering_ids(action.consumed_steering_ids)
             if created:
+                self._enqueue_continuation_signals(source_action="create_plans")
+            if created:
                 self.state.step += 1
                 self._log(
                     f"[runtime run={self._run_tag()}] execute action=create_plans "
@@ -434,6 +596,7 @@ class RuntimeGraph:
                     f"[runtime run={self._run_tag()}] execute action=create_plans "
                     f"created=0 requested={requested_plan_count}"
                 )
+            self.store.save_state(self.state)
             return self.state
 
         if action.type == "dispatch_plans":
@@ -447,6 +610,7 @@ class RuntimeGraph:
             )
             self._consume_steering_ids(action.consumed_steering_ids)
             self.state.step += 1
+            self.store.save_state(self.state)
             self._log(
                 f"[runtime run={self._run_tag()}] execute action=dispatch_plans "
                 f"requested={dispatched.get('plan_ids', [])} dispatched={dispatched.get('dispatched_plan_ids', [])}"
@@ -484,9 +648,11 @@ class RuntimeGraph:
         if action.type == "emit_stage_synthesis":
             stage_summary = str(action.payload.get("stage_synthesis", "") or "")
             batch = self._resolve_target_batch(action.payload)
+            citations = self._parse_provenance_citations(action.payload.get("citations"))
             if batch is not None:
                 batch.stage_summary_emitted = True
                 batch.stage_summary_markdown = stage_summary
+                batch.stage_summary_citations = citations
                 batch.status = "stage_summarized"
                 if stage_summary:
                     batch.stage_synthesis_refs.append(stage_summary)
@@ -496,6 +662,7 @@ class RuntimeGraph:
                     {
                         "dispatch_turn_index": batch.dispatch_turn_index if batch is not None else None,
                         "stage_synthesis": stage_summary,
+                        "citations": self._serialize_provenance_citations(citations),
                     }
                 )
             stage_payload: dict[str, Any] = {
@@ -508,26 +675,18 @@ class RuntimeGraph:
                 ),
                 "plan_ids": list(batch.plan_ids) if batch is not None else [],
             }
-            if isinstance(action.payload.get("citations"), list):
-                stage_payload["citations"] = action.payload["citations"]
+            if citations:
+                stage_payload["citations"] = self._serialize_provenance_citations(citations)
             self.store.log_progress_evaluation(stage_payload)
             self.store.log_master_agent_tool_result("emit_stage_synthesis", stage_payload)
             self.state.timeline.append(
                 TimelineEntry(entry_type="emit_stage_synthesis", content=stage_payload)
             )
             self._consume_steering_ids(action.consumed_steering_ids)
-            if self._should_enqueue_post_stage_summary_review(batch):
-                signal = {
-                    "kind": "post_stage_summary_review_ready",
-                    "source_action": "emit_stage_synthesis",
-                    "dispatch_turn_index": batch.dispatch_turn_index if batch is not None else None,
-                    "reason": "stage_summary_emitted_and_all_current_work_is_terminal",
-                }
-                self._enqueue_internal_signal(signal)
-                self._log(
-                    f"[runtime run={self._run_tag()}] signal=post_stage_summary_review_ready "
-                    f"dispatch_turn_index={signal.get('dispatch_turn_index')}"
-                )
+            self._enqueue_continuation_signals(
+                source_action="emit_stage_synthesis",
+                target_batch=batch,
+            )
             self.state.step += 1
             self.store.save_state(self.state)
             self._log(
@@ -549,9 +708,12 @@ class RuntimeGraph:
             final_report_payload: dict[str, Any] = {
                 "final_report": self.state.final_summary,
             }
-            latest_batch = self._resolve_target_batch({})
+            citations = self._parse_provenance_citations(action.payload.get("citations"))
+            latest_batch = self._resolve_target_batch(action.payload)
             if latest_batch is not None:
                 final_report_payload["dispatch_turn_index"] = latest_batch.dispatch_turn_index
+            if citations:
+                final_report_payload["citations"] = self._serialize_provenance_citations(citations)
             self.store.log_master_agent_tool_result(
                 "emit_final_report",
                 final_report_payload,
@@ -612,16 +774,25 @@ class RuntimeGraph:
         self.state = state
         assert self.state is not None
         self.store.save_state(self.state)
-        self.store.append_event(
-            "run_completed",
-            {
-                "total_steps": self.state.step,
-                "total_insights": self.state.total_atomic_insights(),
-                "total_summaries": self.state.total_summaries(),
-                "total_failures": self.state.failure_count,
-                "final_status": self.state.status,
-            },
-        )
+        completion_payload: dict[str, Any] = {
+            "total_steps": self.state.step,
+            "total_insights": self.state.total_atomic_insights(),
+            "total_summaries": self.state.total_summaries(),
+            "total_failures": self.state.failure_count,
+            "final_status": self.state.status,
+        }
+        if self.state.timeline:
+            latest_entry = self.state.timeline[-1]
+            if str(latest_entry.entry_type or "") == "emit_final_report":
+                latest_content = latest_entry.content if isinstance(latest_entry.content, dict) else {}
+                final_report = str(latest_content.get("final_report", "") or "").strip()
+                if final_report:
+                    completion_payload["final_report"] = final_report
+                if isinstance(latest_content.get("dispatch_turn_index"), int):
+                    completion_payload["dispatch_turn_index"] = int(latest_content["dispatch_turn_index"])
+                if isinstance(latest_content.get("citations"), list):
+                    completion_payload["citations"] = latest_content["citations"]
+        self.store.append_event("run_completed", completion_payload)
         self._log(
             f"[runtime run={self._run_tag()}] node=finalize_run "
             f"status={self.state.status} steps={self.state.step}"
@@ -655,15 +826,64 @@ class RuntimeGraph:
         signals = self.worker_runtime.pop_finished_signals()
         if not signals:
             return False
+        should_wake_orchestrator = False
+        dispatch_ready_plan_ids: list[str] = []
+        finished_results = self.worker_runtime.pop_finished_results()
+        overridden_plan_ids = {
+            plan_id
+            for plan_id, _result in finished_results
+            if (
+                (plan := self.state.get_plan_by_id(plan_id)) is not None
+                and plan.control_state in {"pause_requested", "terminate_requested"}
+            )
+        }
         latest_persisted = self.store.load_state()
         if latest_persisted is not None:
             self.state.artifacts = latest_persisted.artifacts
-            self.state.findings = latest_persisted.findings
-        for plan_id, result in self.worker_runtime.pop_finished_results():
+            self.state.findings = [
+                finding
+                for finding in latest_persisted.findings
+                if finding.plan_id not in overridden_plan_ids
+            ]
+        for plan_id, result in finished_results:
             plan = self.state.get_plan_by_id(plan_id)
             if plan is None:
                 continue
             if result is None:
+                continue
+            if plan.control_state == "terminate_requested":
+                plan.status = "terminated"
+                plan.control_state = "none"
+                plan.pending_modified_text = None
+                plan.launch_requested = False
+                checkpoint_path = getattr(result, "checkpoint_path", None)
+                if checkpoint_path:
+                    plan.checkpoint_path = checkpoint_path
+                self.store.log_plan_status_changed(plan)
+                self._sync_batches_for_plan_transition(plan_id)
+                self._log(
+                    f"[runtime run={self._run_tag()}] signal=worker_status_updated "
+                    f"plan={plan_id} action=terminate checkpoint={plan.checkpoint_path or '<none>'}"
+                )
+                continue
+            if plan.control_state == "pause_requested":
+                checkpoint_path = getattr(result, "checkpoint_path", None)
+                if checkpoint_path:
+                    plan.checkpoint_path = checkpoint_path
+                if plan.pending_modified_text:
+                    self._apply_pending_modification(plan)
+                    dispatch_ready_plan_ids.append(plan_id)
+                    should_wake_orchestrator = True
+                else:
+                    plan.status = "paused"
+                    plan.control_state = "none"
+                    plan.launch_requested = False
+                self.store.log_plan_status_changed(plan)
+                self._sync_batches_for_plan_transition(plan_id)
+                self._log(
+                    f"[runtime run={self._run_tag()}] signal=worker_status_updated "
+                    f"plan={plan_id} action=pause checkpoint={plan.checkpoint_path or '<none>'}"
+                )
                 continue
             control_action = getattr(result, "control_action", None)
             if control_action == "yield":
@@ -702,6 +922,7 @@ class RuntimeGraph:
                 continue
 
             if isinstance(result, dict) and result.get("insight") is not None:
+                should_wake_orchestrator = True
                 for record in result.get("execution_records", []) or []:
                     self.state.execution_records.append(record)
                     self.store.log_execution_completed(record)
@@ -726,6 +947,7 @@ class RuntimeGraph:
                     f"plan={plan_id} insight={insight.insight_id} short_label={insight.short_label or '<none>'}"
                 )
             else:
+                should_wake_orchestrator = True
                 plan.status = "failed"
                 plan.control_state = "none"
                 plan.pending_modified_text = None
@@ -738,6 +960,8 @@ class RuntimeGraph:
                     f"plan={plan_id} action=failed"
                 )
         for signal in signals:
+            if signal.plan_id in overridden_plan_ids and signal.kind == "worker_finding_ready":
+                continue
             self.state.timeline.append(
                 TimelineEntry(
                     entry_type=signal.kind,
@@ -748,14 +972,30 @@ class RuntimeGraph:
                     },
                 )
             )
+        if dispatch_ready_plan_ids:
+            dispatch_ready_signal = self._dispatch_ready_signal_for_runnable_plans(
+                dispatch_ready_plan_ids,
+                source_action="modify_launch_ready",
+            )
+            if dispatch_ready_signal is not None and self._enqueue_internal_signal(dispatch_ready_signal):
+                self._log(
+                    f"[runtime run={self._run_tag()}] signal=dispatch_ready "
+                    f"plan_ids={dispatch_ready_signal.get('plan_ids', [])} "
+                    "source_action='modify_launch_ready'"
+                )
+        if should_wake_orchestrator:
+            self._enqueue_continuation_signals(source_action="worker_update")
         self.store.save_state(self.state)
-        return True
+        return should_wake_orchestrator
 
-    def _apply_pending_runtime_inputs(self) -> None:
+    def _apply_pending_runtime_inputs(self) -> RuntimeInputApplicationSummary:
         assert self.state is not None
+        summary = RuntimeInputApplicationSummary()
         while self._pending_runtime_inputs:
             item = self._pending_runtime_inputs.pop(0)
             if isinstance(item, SteeringRequest):
+                summary.has_inputs = True
+                summary.should_wake_orchestrator = True
                 self._register_steering(item)
                 self.state.master_agent_state.message_history.append(item.to_dict())
                 current_turn = self.state.current_turn()
@@ -765,6 +1005,9 @@ class RuntimeGraph:
                         current_turn.accepted_steering_ids.append(item.steering_id)
                 continue
             if isinstance(item, ExecutionControlRequest):
+                summary.has_inputs = True
+                if self._execution_control_requires_orchestrator(item):
+                    summary.should_wake_orchestrator = True
                 self._register_execution_control(item)
                 self._apply_execution_control(item)
                 current_turn = self.state.current_turn()
@@ -772,6 +1015,7 @@ class RuntimeGraph:
                     current_turn.triggering_inputs.append(item.to_dict())
                 continue
         self.store.save_state(self.state)
+        return summary
 
     def _apply_execution_control(self, control: ExecutionControlRequest) -> None:
         assert self.state is not None
@@ -916,6 +1160,31 @@ class RuntimeGraph:
                 return batch
         return None
 
+    def _pending_unbatched_create_group_for_plan(self, plan_id: str) -> list[str]:
+        assert self.state is not None
+        normalized_plan_id = str(plan_id or "").strip()
+        if not normalized_plan_id:
+            return []
+        for entry in reversed(self.state.timeline):
+            if str(getattr(entry, "entry_type", "") or "") != "create_plans":
+                continue
+            content = entry.content if isinstance(entry.content, dict) else {}
+            group_plan_ids = [
+                str(item).strip()
+                for item in content.get("plan_ids", []) or []
+                if str(item).strip()
+            ]
+            if normalized_plan_id not in group_plan_ids:
+                continue
+            return [
+                group_plan_id
+                for group_plan_id in group_plan_ids
+                if (plan := self.state.get_plan_by_id(group_plan_id)) is not None
+                and plan.status in {"pending", "paused"}
+                and self._batch_for_plan(group_plan_id) is None
+            ]
+        return []
+
     def _normalize_dispatch_request_to_single_batch(
         self,
         requested_plan_ids: list[str],
@@ -929,6 +1198,9 @@ class RuntimeGraph:
                 first_plan_batch,
                 [plan_id for plan_id in ordered_requested if plan_id in first_plan_batch.plan_ids],
             )
+        first_create_group = self._pending_unbatched_create_group_for_plan(ordered_requested[0])
+        if first_create_group:
+            return (None, first_create_group)
         return (
             None,
             [plan_id for plan_id in ordered_requested if self._batch_for_plan(plan_id) is None],
@@ -1026,27 +1298,6 @@ class RuntimeGraph:
             created.append(plan)
             self.state.plans.append(plan)
             self.store.log_plan_created(plan)
-        if created:
-            created_plan_ids = [plan.plan_id for plan in created]
-            batch = DispatchBatchState(
-                dispatch_turn_index=len(self.state.master_agent_state.dispatch_batches),
-                plan_ids=created_plan_ids,
-                waiting_plan_ids=list(created_plan_ids),
-            )
-            self.state.master_agent_state.dispatch_batches.append(batch)
-            current_turn = self.state.current_turn()
-            if current_turn is not None:
-                current_turn.dispatch_batches.append(batch)
-            dispatch_ready_signal = self._dispatch_ready_signal_for_runnable_plans(
-                created_plan_ids,
-                source_action="create_plans",
-            )
-            if dispatch_ready_signal is not None:
-                self._enqueue_internal_signal(dispatch_ready_signal)
-                self._log(
-                    f"[runtime run={self._run_tag()}] signal=dispatch_ready "
-                    f"plan_ids={dispatch_ready_signal.get('plan_ids', [])}"
-                )
         self.store.save_state(self.state)
         return created
 
