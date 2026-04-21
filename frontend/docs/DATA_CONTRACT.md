@@ -58,7 +58,14 @@ interface ExecutionControlRequest {
 }
 
 interface RuntimeSignal {
-  kind: 'worker_finding_ready' | 'worker_status_updated' | 'dispatch_ready' | string;
+  kind:
+    | 'worker_finding_ready'
+    | 'worker_status_updated'
+    | 'dispatch_ready'
+    | 'post_emit_response_review_ready'
+    | 'post_stage_summary_review_ready'
+    | 'unprocessed_steering_ready'
+    | string;
   plan_id?: string;
   finding_id?: string;
   checkpoint_ref?: string;
@@ -89,6 +96,47 @@ interface OrchestratorAction {
   rationale: string;
   consumed_steering_ids: string[];
   payload: Record<string, unknown>;
+}
+
+interface EvaluateProgressPayload {
+  progress_digest: string;
+  dispatch_turn_index?: number;
+  plan_ids?: string[];
+}
+
+interface EmitStageSynthesisPayload {
+  stage_synthesis: string;
+  dispatch_turn_index?: number;
+  citations?: Array<{
+    marker: number;
+    target: SteeringTargetSnapshot;
+    label: string;
+  }>;
+}
+
+interface EmitFinalReportPayload {
+  final_report: string;
+  dispatch_turn_index?: number;
+  citations?: Array<{
+    marker: number;
+    target: SteeringTargetSnapshot;
+    label: string;
+  }>;
+}
+
+interface RunCompletedPayload {
+  total_steps: number;
+  total_insights: number;
+  total_summaries?: number;
+  total_failures: number;
+  final_status: string;
+  final_report?: string;
+  dispatch_turn_index?: number;
+  citations?: Array<{
+    marker: number;
+    target: SteeringTargetSnapshot;
+    label: string;
+  }>;
 }
 
 interface InsightEvidence {
@@ -128,6 +176,10 @@ Notes:
 - `WorkerFinding` is the summarizer's pre-materialization worker output object.
 - `WorkerFinding.atomic_insights[].evidence.code_path`, `output_path`, and `plot_path` are required grounding fields in the implementation contract.
 - Frontend adapters must not weaken the grounding requirement when they project findings into UI state.
+- Citation payloads on `emit_stage_synthesis`, `emit_final_report`, and `run_completed` are canonical-only: each citation uses `marker` + `target` (+ optional `label`), where `target.kind` must be `summary` or `atomic`.
+- Citation targets must include `target.summary_id`; `target.atomic_id` is required when `target.kind='atomic'`.
+- Narrative markdown that references citations should use inline `[[n]]` markers aligned with citation markers (positive, unique, increasing).
+- Legacy citation keys such as `insight_id`, `finding_id`, `source_id`, and `plan_id` are unsupported for new writes.
 
 ## Canonical Runtime State Model
 
@@ -164,9 +216,14 @@ interface PlanState {
   text: string;
   source: string;
   status: string;
+  control_state?: 'none' | 'pause_requested' | 'terminate_requested';
   assigned_worker?: string;
   resume_phase?: string;
   checkpoint_ref?: string;
+  pending_modified_text?: string | null;
+  launch_requested?: boolean;
+  final_summary?: string | null;
+  error_message?: string | null;
   linked_steering_ids: string[];
   linked_control_ids: string[];
   revision: number;
@@ -251,6 +308,7 @@ Frontend adapters must preserve the following rules:
 
 - do not project `create` into the steering-kind namespace
 - do not document or persist an alternate canonical plan-control vocabulary in place of `launch`, `pause`, `terminate`, and `modify`
+- for active plans, `modify` may be sent first without `user_authored_text` to request pause; text revision is then sent by a follow-up `modify`
 - keep `selected_keywords` as a steering-level affordance for summary/atomic `focus` and `ignore` when the frontend uses keyword-priority UI
 - preserve the target snapshot rather than fabricating alternate target models on the client
 
@@ -262,6 +320,9 @@ Frontend consumers should map canonical backend outputs as follows:
 - `OrchestratorAction(type='emit_stage_synthesis')` -> stage-synthesis UI and storyline projection
 - `OrchestratorAction(type='emit_final_report')` -> final-report UI and storyline projection
 - `WorkerFinding` -> summary and atomic-insight rendering in chat, storyline, and inspector
+- evaluate/stage/final payloads may include `dispatch_turn_index` and `citations` to keep storyline/chat provenance aligned
+- `run_completed` may include `final_report`, `dispatch_turn_index`, and `citations` when the latest terminal action was `emit_final_report`
+- citation rendering relies on canonical citation payloads plus inline `[[n]]` markers; consumers should treat non-canonical citation shapes as compatibility-only and ignore them
 - runtime signals -> refresh or wake-up cues for streaming/event consumers
 
 The frontend may maintain additional derived view models for chat cards, storyline nodes, filters, or inspector state, but those projections must remain traceable to the canonical runtime objects above.
@@ -273,6 +334,7 @@ The current frontend still exposes `/api/runs/:runId/report` as a compatibility 
 - This route is not part of the canonical backend runtime in `implementation.md`.
 - The current compatibility behavior is a successful empty result rather than report generation through the core runtime.
 - Frontend consumers should treat empty `report_path` / `report_pack_path` values as "no generated report is available".
+- Gateway state reads may also include optimistic projection of still-unapplied `plan_controls.jsonl` entries; treat projected plan-control fields as compatibility view-model state rather than a separate canonical contract.
 
 ## Persistence and Artifact Projection
 

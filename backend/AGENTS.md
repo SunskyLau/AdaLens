@@ -56,7 +56,7 @@ The runtime graph persists checkpoints through the configured `LangGraph` checkp
 - `launch` starts a pending thread or resumes a paused thread
 - `pause` requests a safe stop and checkpoint
 - `terminate` applies immediately to pending/paused work and at the next safe boundary to active work
-- `modify` pauses safely, revises the plan text, increments the revision, and returns the plan to a schedulable state
+- `modify` supports a two-phase flow: active work may first receive `modify` without new text to request pause/checkpoint, then a follow-up `modify` with `user_authored_text` revises the plan, increments revision when text changed, and returns the plan to a schedulable state
 - `create` introduces a user-authored plan thread without rewriting the user's text into a synthetic target snapshot
 
 ### Signals
@@ -68,7 +68,9 @@ Canonical examples:
 - `worker_finding_ready`
 - `worker_status_updated`
 - `dispatch_ready`
+- `post_emit_response_review_ready`
 - `post_stage_summary_review_ready`
+- `unprocessed_steering_ready`
 
 Signals wake `wait_for_steering_or_signal` and trigger the next orchestrator round against refreshed persisted state.
 
@@ -120,6 +122,7 @@ Implementation rules that must stay aligned with the supplement:
 - treat worker findings, worker completion, scheduling events, and other wake-up conditions as signals for the next deliberation round
 - use stage synthesis only when the current unsummarized evidence window supports a stable intermediate conclusion
 - emit the final report only when the run is truly ready to finish and core conclusions are grounded in existing findings and evidence
+- for stage/final synthesis citations, emit canonical provenance only (`marker` + `target(summary|atomic)` + optional `label`) and keep inline `[[n]]` markers aligned with citation markers; do not emit legacy keys such as `insight_id` / `finding_id` / `source_id` / `plan_id`
 
 Do not reintroduce alternate orchestrator output names such as `respond_to_user`, `mark_complete`, or other parallel action vocabularies in backend contract docs.
 
@@ -149,7 +152,7 @@ The Summarizer converts one completed analysis stream into one `WorkerFinding`.
 Worker execution is asynchronous relative to the main graph.
 
 - `dispatch_plans` submits work to workers and returns the main graph to listening mode.
-- Worker control polling occurs across analysis and summarization boundaries.
+- Worker control polling occurs across analysis/summarization boundaries and during long-running model/tool work.
 - Safe pauses checkpoint the worker session and emit `worker_status_updated`.
 - Persisted findings emit `worker_finding_ready` after materialization.
 - Worker finding materialization must happen before finding-ready signals are emitted.
@@ -184,6 +187,7 @@ Persistence responsibilities:
 - `backend/framework/runtime_graph.py`, `backend/framework/worker_runtime.py`, and `backend/framework/orchestrator_agent.py` / `analyzer_agent.py` / `summarizer_agent.py` are the internal implementation-aligned modules used by those facades
 - `backend/framework/persistence.py` owns filesystem persistence and exports the `RunStore` alias used by callers
 - `backend/framework/importance.py` remains the canonical implementation of importance / interest / significance / impact scoring
+- `backend/run_gateway_flask.py` owns the local Flask HTTP/SSE gateway and compatibility projections for frontend consumption
 
 ## Documentation Discipline
 

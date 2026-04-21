@@ -4,6 +4,7 @@
 
 - `main.py` runs the backend directly against a dataset for local experimentation.
 - `cli.py` is the command-line entrypoint used by the Run Gateway for start/resume flows.
+- `run_gateway_flask.py` is the local HTTP/SSE Run Gateway used by `frontend/npm run dev`.
 - `config.py` holds model names, runtime defaults, and shared backend configuration.
 - `runtime_clock.py` provides runtime timestamp helpers.
 - `utils.py` contains shared backend utilities such as streaming Python execution.
@@ -18,6 +19,7 @@
 - `framework/summarizer_agent.py` converts one completed analysis stream into one `WorkerFinding`.
 - `framework/persistence.py` owns run directories, events, artifacts, and checkpoint writes.
 - `framework/master_agent.py` and `framework/sub_agent.py` are compatibility facades over the current runtime modules.
+- `runs/*/plan_controls.jsonl` persists execution-control requests consumed by the runtime and projected by the gateway.
 
 ## Tests
 

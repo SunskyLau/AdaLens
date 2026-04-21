@@ -1,7 +1,7 @@
 # Create Plans Replay
 
 `create_plans` supports a development-only replay mode that replaces model-authored
-plan text with hardcoded values from `backend/cache.json`.
+plan text with values loaded from an optional `backend/cache.json`.
 
 ## Enable Replay
 
@@ -30,6 +30,9 @@ npm run dev -- --replay --stable
 ## Cache File
 
 Replay data lives in `backend/cache.json`.
+
+No default `backend/cache.json` sample is tracked in git now. Create this file
+locally when you want replay behavior.
 
 The file uses a simple JSON object:
 

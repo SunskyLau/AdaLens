@@ -18,7 +18,7 @@
 
 - `../backend/run_gateway_flask.py` implements the local HTTP/SSE gateway used by the UI.
 - `src/server/devLauncher.mjs` starts the gateway and Vite together for local development.
-- `src/server/planControl.ts` contains optimistic plan-control response shaping for the frontend.
+- `src/server/planControl.ts` contains shared optimistic plan-control projection helpers used by frontend compatibility logic and tests.
 
 ## Tests
 

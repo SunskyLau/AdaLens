@@ -41,6 +41,8 @@ The workspace should map user interactions to runtime inputs as follows:
 
 Frontend copy may distinguish pending-versus-paused launch behavior for users, but adapters and docs must preserve `launch` as the canonical execution-control action.
 
+When `modify` targets an actively running plan (`analyzing` / `summarizing`), frontend and gateway adapters may use a two-step flow: first submit `modify` without `user_authored_text` to request pause, then submit `modify` with edited text once the plan is paused.
+
 ## Workspace Behavior Constraints
 
 The following frontend behaviors remain part of the workspace contract as long as they do not redefine backend/runtime semantics:
@@ -53,6 +55,7 @@ The following frontend behaviors remain part of the workspace contract as long a
 - Stage-synthesis and final-report projections may be bridged back into storyline converges when the frontend has the provenance needed to do so.
 - `/api/runs/:runId/report` is currently a compatibility placeholder that returns a successful empty result; the UI may keep its existing affordances, but the backend runtime does not currently generate report artifacts through the new core loop.
 - The frontend should continue consuming gateway-projected compatibility payloads; the backend runtime may use implementation-aligned internal state objects that are richer than the component-facing facade.
+- Gateway state reads may include optimistic projection of unapplied `plan_controls.jsonl` entries; UI/state code should treat projected plan-control fields (`control_state`, `launch_requested`, `pending_modified_text`) as the latest compatibility view.
 
 Detailed rendering, layout, and interaction requirements for storyline remain in `frontend/src/components/AGENTS.md`.
 
@@ -61,7 +64,7 @@ Detailed rendering, layout, and interaction requirements for storyline remain in
 - `src/api/` holds gateway client code
 - `src/components/` holds workspace UI, storyline, conversation, and inspector components
 - `src/pages/` holds route-level pages
-- `src/server/` holds the local Run Gateway implementation
+- `src/server/` holds the frontend dev launcher and compatibility helper modules (the canonical local Run Gateway implementation is `../backend/run_gateway_flask.py`)
 - `src/store/` holds application state
 - `src/types/` holds shared frontend-side types and adapters
 

@@ -12,6 +12,7 @@
 This repository is split into `backend/` and `frontend/`.
 
 - `backend/main.py` and `backend/cli.py` are the main Python entry points.
+- `backend/run_gateway_flask.py` is the local HTTP/SSE Run Gateway used by the frontend dev flow.
 - `backend/framework/models.py` contains the shared runtime and projection models.
 - `backend/framework/master_agent.py` and `backend/framework/sub_agent.py` are the backend runtime entry facades aligned to the implementation supplement.
 - `backend/framework/runtime_graph.py`, `backend/framework/worker_runtime.py`, and `backend/framework/orchestrator_agent.py` / `analyzer_agent.py` / `summarizer_agent.py` are the internal implementation-aligned runtime modules behind those facades.
@@ -19,6 +20,7 @@ This repository is split into `backend/` and `frontend/`.
 - `backend/framework/importance.py` remains the canonical implementation for importance and related scoring metrics.
 - `backend/test/` contains backend tests.
 - `frontend/src/` contains the React/Vite workspace UI, organized into `components/`, `pages/`, `server/`, `store/`, `api/`, and `utils/`.
+- `frontend/src/server/devLauncher.mjs` starts Vite together with the backend Flask Run Gateway for local development.
 - `frontend/docs/` holds frontend-facing projections of runtime contracts.
 - `data/` contains sample datasets.
 

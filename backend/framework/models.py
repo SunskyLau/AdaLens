@@ -5,7 +5,15 @@ from datetime import datetime
 import uuid
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, RootModel, TypeAdapter, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 
 from runtime_clock import now_iso
 from config import (
@@ -137,16 +145,77 @@ class EmitResponsePayloadModel(BaseModel):
     response: str
 
 
+class CanonicalCitationTargetSummaryModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["summary"]
+    summary_id: str = Field(min_length=1)
+    summary_short_label: str = ""
+    summary_text: str = ""
+    columns: list[str] = Field(default_factory=list)
+    insight_type: InsightType | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+    provenance_refs: list[str] = Field(default_factory=list)
+
+
+class CanonicalCitationTargetAtomicModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["atomic"]
+    summary_id: str = Field(min_length=1)
+    summary_short_label: str = ""
+    summary_text: str = ""
+    columns: list[str] = Field(default_factory=list)
+    atomic_id: str = Field(min_length=1)
+    atomic_text: str | None = None
+    insight_type: InsightType | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+    provenance_refs: list[str] = Field(default_factory=list)
+
+
+CanonicalCitationTargetModel = Annotated[
+    CanonicalCitationTargetSummaryModel | CanonicalCitationTargetAtomicModel,
+    Field(discriminator="kind"),
+]
+
+
+class CanonicalCitationPayloadModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    marker: int = Field(ge=1)
+    target: CanonicalCitationTargetModel
+    label: str = ""
+
+    @model_validator(mode="after")
+    def _populate_default_label(self) -> "CanonicalCitationPayloadModel":
+        if self.label.strip():
+            return self
+        if self.target.kind == "atomic":
+            fallback = (
+                self.target.atomic_id.strip()
+                or self.target.summary_short_label.strip()
+                or self.target.summary_id.strip()
+            )
+        else:
+            fallback = (
+                self.target.summary_short_label.strip()
+                or self.target.summary_text.strip()
+                or self.target.summary_id.strip()
+            )
+        self.label = fallback
+        return self
+
+
 class EmitStageSynthesisPayloadModel(BaseModel):
     stage_synthesis: str
     dispatch_turn_index: int | None = None
-    citations: list[dict[str, Any]] = Field(default_factory=list)
+    citations: list[CanonicalCitationPayloadModel] = Field(default_factory=list)
 
 
 class EmitFinalReportPayloadModel(BaseModel):
     final_report: str
     dispatch_turn_index: int | None = None
-    citations: list[dict[str, Any]] = Field(default_factory=list)
+    citations: list[CanonicalCitationPayloadModel] = Field(default_factory=list)
 
 
 ValidatedOrchestratorPayload = (

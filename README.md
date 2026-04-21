@@ -4,8 +4,8 @@ AdaLens is an exploratory data analysis workspace with a Python runtime and a Re
 
 ## Project Layout
 
-- `backend/` contains the runtime, worker pipeline, persistence layer, and backend tests.
-- `frontend/` contains the UI, local Run Gateway, and frontend tests.
+- `backend/` contains the runtime, worker pipeline, Flask Run Gateway, persistence layer, and backend tests.
+- `frontend/` contains the UI, development launcher/helpers, and frontend tests.
 - `data/` contains sample datasets you can use to try the system.
 
 See [backend/README.md](backend/README.md) and [frontend/README.md](frontend/README.md) for file-level pointers.
@@ -41,7 +41,7 @@ cd frontend
 npm run dev
 ```
 
-This starts the local Run Gateway and the Vite app together. Open the local URL printed by Vite in your browser, then upload a CSV or use one of the sample datasets from `data/`.
+This starts the backend Flask Run Gateway and the Vite app together. Open the local URL printed by Vite in your browser, then upload a CSV or use one of the sample datasets from `data/`.
 
 ## Helpful Commands
 

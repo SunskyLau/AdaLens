@@ -16,6 +16,7 @@ from config import (
 )
 from .language_context import contains_cjk_text, latest_user_authored_text
 from .models import (
+    CanonicalCitationPayloadModel,
     CreatePlanItemPayloadModel,
     DispatchBatchState,
     Insight,
@@ -226,6 +227,11 @@ def _build_orchestrator_augmentation_prompt() -> str:
         "- Do not infer that work has already started merely because a batch exists or is marked dispatched; confirm worker activity from active plans / active workers before choosing to wait for execution.\n"
         "- Review-ready signals indicate that another deliberation round is worthwhile; they do not require continuation, and `wait` remains valid when no materially useful action is justified.\n"
         "- Avoid repetitive acknowledgement loops. If a review-ready signal wakes a new round but there is no new substantive explanation or follow-up work to do, prefer `wait` over another redundant `emit_response`.\n"
+        "- For stage/final synthesis, cite inline with `[[n]]` markers in markdown and keep those markers aligned with `citations` markers.\n"
+        "- For `emit_stage_synthesis` and `emit_final_report`, each citation must use canonical fields only: `marker`, `target`, and optional `label`.\n"
+        "- Canonical citation targets must use `target.kind` as `summary` or `atomic`; include `target.summary_id` always, and include `target.atomic_id` when `target.kind` is `atomic`.\n"
+        "- Citation markers must be positive integers, unique, and increasing.\n"
+        "- Never use legacy citation keys: `insight_id`, `finding_id`, `source_id`, `plan_id`.\n"
         "- If multiple tool calls seem desirable in the same round, choose the single most important tool call first. The runtime can wake another round when continuation signals still remain.\n"
     )
 
@@ -1529,13 +1535,13 @@ class _EmitResponseToolArgs(_OrchestratorToolArgsBase):
 class _EmitStageSynthesisToolArgs(_OrchestratorToolArgsBase):
     stage_synthesis: str
     dispatch_turn_index: int | None = None
-    citations: list[dict[str, Any]] = Field(default_factory=list)
+    citations: Any = Field(default_factory=list)
 
 
 class _EmitFinalReportToolArgs(_OrchestratorToolArgsBase):
     final_report: str
     dispatch_turn_index: int | None = None
-    citations: list[dict[str, Any]] = Field(default_factory=list)
+    citations: Any = Field(default_factory=list)
 
 
 _ORCHESTRATOR_TOOL_ARG_MODELS: dict[str, type[_OrchestratorToolArgsBase]] = {
@@ -1547,6 +1553,67 @@ _ORCHESTRATOR_TOOL_ARG_MODELS: dict[str, type[_OrchestratorToolArgsBase]] = {
     "emit_stage_synthesis": _EmitStageSynthesisToolArgs,
     "emit_final_report": _EmitFinalReportToolArgs,
 }
+
+
+def _canonical_citation_item_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "marker": {"type": "integer", "minimum": 1},
+            "target": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["summary", "atomic"],
+                    },
+                    "summary_id": {"type": "string"},
+                    "summary_short_label": {"type": "string"},
+                    "summary_text": {"type": "string"},
+                    "columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "atomic_id": {"type": "string"},
+                    "atomic_text": {"type": "string"},
+                    "insight_type": {"type": "string"},
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "provenance_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["kind", "summary_id"],
+            },
+            "label": {"type": "string"},
+        },
+        "required": ["marker", "target"],
+    }
+
+
+def _normalize_canonical_citations(raw_items: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_items, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    seen_markers: set[int] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            citation = CanonicalCitationPayloadModel.model_validate(item)
+        except ValidationError:
+            continue
+        if citation.marker in seen_markers:
+            continue
+        seen_markers.add(citation.marker)
+        normalized.append(citation.model_dump())
+    normalized.sort(key=lambda item: int(item.get("marker", 0)))
+    return normalized
 
 
 def _orchestrator_tool_specs() -> list[dict[str, Any]]:
@@ -1665,7 +1732,7 @@ def _orchestrator_tool_specs() -> list[dict[str, Any]]:
                         "dispatch_turn_index": {"type": "integer"},
                         "citations": {
                             "type": "array",
-                            "items": {"type": "object"},
+                            "items": _canonical_citation_item_schema(),
                         },
                     },
                     "required": ["stage_synthesis"],
@@ -1685,7 +1752,7 @@ def _orchestrator_tool_specs() -> list[dict[str, Any]]:
                         "dispatch_turn_index": {"type": "integer"},
                         "citations": {
                             "type": "array",
-                            "items": {"type": "object"},
+                            "items": _canonical_citation_item_schema(),
                         },
                     },
                     "required": ["final_report"],
@@ -1740,15 +1807,17 @@ def _parse_orchestrator_tool_message(
         payload = {"stage_synthesis": validated_args.stage_synthesis}
         if validated_args.dispatch_turn_index is not None:
             payload["dispatch_turn_index"] = validated_args.dispatch_turn_index
-        if validated_args.citations:
-            payload["citations"] = list(validated_args.citations)
+        normalized_citations = _normalize_canonical_citations(validated_args.citations)
+        if "citations" in raw_args or normalized_citations:
+            payload["citations"] = normalized_citations
     elif tool_name == "emit_final_report":
         validated_args = _EmitFinalReportToolArgs.model_validate(validated_args)
         payload = {"final_report": validated_args.final_report}
         if validated_args.dispatch_turn_index is not None:
             payload["dispatch_turn_index"] = validated_args.dispatch_turn_index
-        if validated_args.citations:
-            payload["citations"] = list(validated_args.citations)
+        normalized_citations = _normalize_canonical_citations(validated_args.citations)
+        if "citations" in raw_args or normalized_citations:
+            payload["citations"] = normalized_citations
     else:
         return None, f"structured_output_unknown_action_tool: {tool_name}"
 
