@@ -1,24 +1,35 @@
-# Frontend Overview
+# AdaLens Frontend Overview
 
-## Key Files
+## Highlights
+
+- Chat-first analysis workflow with resumable runs and follow-up turns.
+- Storyline view for summaries, atomic insights, active plan areas, and replayable steering history.
+- Header-level `Sub-agents` concurrency slider with canonical `1-6` range, default `2`, and persistence to run settings.
+- Top-left vertical storyline pen toolbar for `focus`, `ignore`, and `elaborate` steering.
+- Column, summary, and atomic steering with summarizer-generated keywords for insight-targeted `focus` / `ignore`.
+- Blank-space storyline `create` flow for injecting exactly one user-authored analysis plan into the current dispatch flow.
+
+## Key Files and Folders
 
 - `package.json` defines the frontend dev, build, and test commands.
 - `index.html` is the Vite entry HTML file.
 - `src/api/client.ts` contains the browser-side API client for the Run Gateway.
 - `src/store/useStore.ts` is the main Zustand store and event-projection layer.
-- `src/types/index.ts` defines the frontend-facing runtime types and event shapes.
-
-## UI Modules
-
-- `src/components/` contains the conversation UI, storyline graph, inspector, and shared presentation components.
-- `src/pages/Workspace.tsx` is the main workspace page.
-- `src/steering/` contains steering-target helpers and prompt-building utilities.
-
-## Local Run Gateway
-
-- `../backend/run_gateway_flask.py` implements the local HTTP/SSE gateway used by the UI.
 - `src/server/devLauncher.mjs` starts the gateway and Vite together for local development.
 - `src/server/planControl.ts` contains shared optimistic plan-control projection helpers used by frontend compatibility logic and tests.
+- `src/pages/Workspace.tsx` is the main workspace page.
+
+```text
+frontend/
+  src/
+    api/         API client for the Run Gateway
+    components/  conversation UI, storyline, inspector, and shared presentation components
+    pages/       Route-level pages
+    server/      Local Run Gateway implementation
+    steering/    steering-target helpers and utilities
+    store/       Zustand application state
+    types/       Shared frontend contracts
+```
 
 ## Build Output
 

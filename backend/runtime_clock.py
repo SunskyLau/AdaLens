@@ -1,8 +1,6 @@
 """
 Shared runtime clock helpers.
 
-This module centralizes backend timestamp generation so model-cache replay can
-freeze timestamp-producing code paths without rewriting each caller.
 """
 
 from __future__ import annotations

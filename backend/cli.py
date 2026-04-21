@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-CLI entrypoint for agentic-eda-v0.1.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -31,7 +26,7 @@ def _resolve_dataset_path(raw: str) -> Path:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Agentic EDA v0.1")
+    parser = argparse.ArgumentParser(description="AdaLens")
     parser.add_argument("--dataset", required=True, help="Path to a CSV dataset")
     parser.add_argument("--goal", help="User analysis goal (deprecated alias for --user-goal)")
     parser.add_argument("--user-goal", dest="user_goal", help="Initial analysis goal")

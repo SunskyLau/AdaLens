@@ -1,6 +1,5 @@
 /**
- * Agentic EDA Frontend Type Definitions
- * Based on DATA_CONTRACT.md v1.14
+ * AdaLens Frontend Type Definitions
  */
 
 // ============================================================================

@@ -1,7 +1,3 @@
-"""
-Agentic EDA v0.1 framework package.
-"""
-
 from .master_agent import MasterAgent
 from .models import (
     AtomicInsight,

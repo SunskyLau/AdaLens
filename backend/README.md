@@ -1,4 +1,4 @@
-# Backend Overview
+# AdaLens Backend Overview
 
 ## Key Files
 
@@ -19,6 +19,7 @@
 - `framework/summarizer_agent.py` converts one completed analysis stream into one `WorkerFinding`.
 - `framework/persistence.py` owns run directories, events, artifacts, and checkpoint writes.
 - `framework/master_agent.py` and `framework/sub_agent.py` are compatibility facades over the current runtime modules.
+- `./run_gateway_flask.py` implements the local HTTP/SSE gateway used by the UI.
 
 ## Generated Output
 

@@ -99,10 +99,7 @@ logs/
 # Temporary files
 *.tmp
 *.temp
-.cache/
 .temp/
-.codex-temp-test*/
-backend/.codex-temp-test*/
 frontend/test/
 backend/test/
 

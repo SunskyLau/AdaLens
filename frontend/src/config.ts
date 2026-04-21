@@ -10,7 +10,7 @@ export const API_BASE = '/api';
 // Run Gateway server port (backend/run_gateway_flask.py).
 export const RUN_GATEWAY_PORT = 3001;
 
-// Backend/frontend run-data contract version (see frontend/docs/DATA_CONTRACT.md).
+// Backend/frontend run-data contract version
 export const DATA_CONTRACT_VERSION = 'v1.13';
 
 // Data View (CSV preview)
@@ -229,8 +229,6 @@ export const COVERAGE_TAXONOMY_V0 = [
   },
 ] as const;
 
-// New taxonomy (v1) - aligned with Insight Taxonomy.v3.md
-// Uses insight_type from summarizer instead of heuristic pattern matching
 export const INSIGHT_TAXONOMY_V1 = [
   { id: 'value', label: 'value' },
   { id: 'proportion', label: 'proportion' },
