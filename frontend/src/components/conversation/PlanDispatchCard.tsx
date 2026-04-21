@@ -275,7 +275,7 @@ export default function PlanDispatchCard({
   );
   const disableModify = isEditing
     ? pendingAction !== null || modifyDraft.trim().length === 0
-    : pendingAction !== null || disableModifyControl || !canModifyAny;
+    : pendingAction !== null || disableModifyControl || !canModifyAny || Boolean(plan?.launch_requested);
   const isCreateAccent = accentVariant === 'create';
   const isExecuting = isStorylineVariant && isActivePlanStatus(displayStatus);
   const rootClasses = [

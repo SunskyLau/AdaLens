@@ -16,7 +16,7 @@
 
 ## Local Run Gateway
 
-- `src/server/index.ts` implements the local HTTP/SSE gateway used by the UI.
+- `../backend/run_gateway_flask.py` implements the local HTTP/SSE gateway used by the UI.
 - `src/server/devLauncher.mjs` starts the gateway and Vite together for local development.
 - `src/server/planControl.ts` contains optimistic plan-control response shaping for the frontend.
 

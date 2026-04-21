@@ -7,7 +7,7 @@
 
 export const API_BASE = '/api';
 
-// Run Gateway server port (frontend/src/server/index.ts).
+// Run Gateway server port (backend/run_gateway_flask.py).
 export const RUN_GATEWAY_PORT = 3001;
 
 // Backend/frontend run-data contract version (see frontend/docs/DATA_CONTRACT.md).

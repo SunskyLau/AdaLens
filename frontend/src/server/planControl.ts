@@ -292,16 +292,18 @@ export function applyPlanControlPreviewToPlanRecord(args: {
     return nextPlan;
   }
 
-  if (action === 'modify' && nextText) {
+  if (action === 'modify') {
     if (status === 'analyzing' || status === 'summarizing') {
       return {
         ...nextPlan,
-        pending_modified_text: nextText,
+        ...(nextText ? { pending_modified_text: nextText } : {}),
         control_state: 'pause_requested',
         launch_requested: false,
       };
     }
-    return applyConfirmedModificationPreview(nextPlan, nextText);
+    if (nextText) {
+      return applyConfirmedModificationPreview(nextPlan, nextText);
+    }
   }
 
   return nextPlan;

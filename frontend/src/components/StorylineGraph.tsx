@@ -407,6 +407,23 @@ export function resolveActiveSteeringPenAfterSuccessfulSubmit(
   return null;
 }
 
+export function shouldKeepEditingPlanStateForPlan(
+  plan: Pick<PlanItem, 'status' | 'control_state'> | null | undefined,
+): boolean {
+  if (!plan) {
+    return false;
+  }
+  if (
+    plan.status === 'pending'
+    || plan.status === 'paused'
+    || plan.status === 'analyzing'
+    || plan.status === 'summarizing'
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export function resolveSelectionAfterConvergeSummaryButtonClick(): Selection {
   return { type: null, id: null };
 }
@@ -692,7 +709,7 @@ export default function StorylineGraph({
         return current;
       }
       const plan = runState.frontier.find((item) => item.plan_id === current.planId);
-      if (!plan || (plan.status !== 'pending' && plan.status !== 'paused')) {
+      if (!shouldKeepEditingPlanStateForPlan(plan)) {
         return null;
       }
       return current;
@@ -2119,6 +2136,34 @@ export default function StorylineGraph({
       planId,
       draft: plan.text ?? '',
     });
+    if (
+      plan.status !== 'analyzing'
+      && plan.status !== 'summarizing'
+    ) {
+      return;
+    }
+    if (plan.control_state !== 'none') {
+      return;
+    }
+    setPlanControlPendingById((current) => ({ ...current, [planId]: 'modify' }));
+    void controlPlan(runState.run_id, planId, 'modify')
+      .then((response) => {
+        if (response.plan) {
+          applyPlanToRunState(runState.run_id, response.plan, response.run_status);
+        } else if (response.run_state) {
+          setRunState(response.run_state);
+        }
+      })
+      .catch((error) => {
+        console.error('Failed to start modify flow:', error);
+      })
+      .finally(() => {
+        setPlanControlPendingById((current) => {
+          const next = { ...current };
+          delete next[planId];
+          return next;
+        });
+      });
   };
 
   const handlePlanModifyDraftChange = (draft: string) => {

@@ -1066,13 +1066,18 @@ class RuntimeGraph:
                 target_plan.status = "terminated"
             else:
                 target_plan.control_state = "terminate_requested"
-        elif control.action == "modify" and control.user_authored_text:
-            next_text = str(control.user_authored_text)
+        elif control.action == "modify":
+            next_text = (
+                str(control.user_authored_text)
+                if control.user_authored_text is not None
+                else None
+            )
             if target_plan.status in {"analyzing", "summarizing"}:
-                target_plan.pending_modified_text = next_text
+                if next_text is not None:
+                    target_plan.pending_modified_text = next_text
                 target_plan.control_state = "pause_requested"
                 target_plan.launch_requested = False
-            else:
+            elif next_text:
                 self._apply_pending_modification(target_plan, next_text)
         self.store.log_plan_status_changed(target_plan)
 

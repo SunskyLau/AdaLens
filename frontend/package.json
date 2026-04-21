@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node src/server/devLauncher.mjs",
     "dev:client": "vite",
-    "dev:server": "tsx watch src/server/index.ts",
+    "dev:server": "python ../backend/run_gateway_flask.py",
     "test": "node test/run-tests.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview"
