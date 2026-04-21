@@ -25,7 +25,10 @@ def _load_dotenv(path: Path) -> None:
             continue
         key, value = line.split("=", 1)
         key = key.strip().lstrip("\ufeff")
-        if key not in {"OPENAI_API_KEY", "OPENAI_API_KEY_vapi", "OPENAI_API_KEY_n1n"}:
+        if key not in {
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY"
+        }:
             continue
         if not key or key in os.environ:
             continue
@@ -55,8 +58,8 @@ OPENAI_CLIENT_CLASS = _load_openai_client_class()
 CHAT_OPENAI_CLASS = _load_langchain_chat_openai_class()
 
 
-OPENAI_BASE_URL = "https://api.vveai.com/v1"
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY_vapi", "")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
 ORCHESTRATOR_MODEL_NAME = "gemini-3.1-pro-preview-thinking"
 ANALYZER_MODEL_NAME = "gemini-3.1-flash-lite-preview"

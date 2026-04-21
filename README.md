@@ -16,6 +16,17 @@ See [backend/README.md](backend/README.md) and [frontend/README.md](frontend/REA
 - Node.js 20+
 - npm
 
+## Environment Variables
+
+Create a `.env` file in the repository root and provide your OpenAI-compatible endpoint and key:
+
+```dotenv
+OPENAI_BASE_URL=your_api_endpoint_here
+OPENAI_API_KEY=your_api_key_here
+```
+
+The backend reads these two values at startup and uses them as the base URL and API key for model calls.
+
 ## Setup
 
 ### Backend
@@ -57,6 +68,5 @@ npm run build
 
 ```powershell
 cd backend
-python -m pytest -q
 python main.py
 ```

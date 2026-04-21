@@ -19,11 +19,6 @@
 - `framework/summarizer_agent.py` converts one completed analysis stream into one `WorkerFinding`.
 - `framework/persistence.py` owns run directories, events, artifacts, and checkpoint writes.
 - `framework/master_agent.py` and `framework/sub_agent.py` are compatibility facades over the current runtime modules.
-- `runs/*/plan_controls.jsonl` persists execution-control requests consumed by the runtime and projected by the gateway.
-
-## Tests
-
-- `test/` contains the backend test suite.
 
 ## Generated Output
 
