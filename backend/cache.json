@@ -1,9 +1,0 @@
-{
-  "1": [
-    "Calculate the correlation coefficients (e.g., Pearson, Spearman) between 'hot_degree' and other numerical columns such as 'followers_count', 'friends_count', 'statuses_count', 'media_count', 'reply_count', 'retweet_count', and 'favorite_count' to identify strong linear or monotonic relationships.",
-    "Investigate how 'hot_degree' correlates with categorical and boolean variables such as 'is_reply', 'status_type', and 'verified' by examining group-wise distributions and mean 'hot_degree' values."
-  ],
-  "2": [
-    "Analyze the relationship between 'hot_degree' and categorical/boolean columns like 'is_reply', 'status_type', and 'verified' by comparing the distribution and average 'hot_degree' across different groups."
-  ]
-}
